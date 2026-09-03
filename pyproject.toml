@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whale-companion-service"
+version = "0.1.0"
+description = "Canonical memory, lifecycle and conversation service for 小鲸 / 大鲸"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+tls = ["certifi>=2024.0.0"]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["whale_companion_service*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
