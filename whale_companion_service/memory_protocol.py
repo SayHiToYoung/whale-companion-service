@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from .dialogue_state import emotional_dialogue_state, is_emotional_bid, is_explicit_stop
 from .memory_lifecycle import lifecycle_transition_from_text
 
 
@@ -208,6 +209,7 @@ def build_grounded_companion_reply(
     memories: list[dict],
     *,
     emotion_label: str = "",
+    conversation: list[dict] | None = None,
 ) -> str:
     """生成不越过已知事实的最小陪伴回复。
 
@@ -232,6 +234,22 @@ def build_grounded_companion_reply(
         return "行，先放下。我不问了。"
     if lifecycle_transition == "active":
         return "嗯，它还没过去。那我不把它当成昨天的事。"
+
+    # “不想说”是边界；单独的一声叹气则更像是在试探有没有人注意到。
+    # 两者必须分开，否则陪伴者会在用户最需要被主动接住时后退。
+    if is_explicit_stop(text):
+        return _stable_choice(text, (
+            "好，那就不说。你不用为了让我有话接，硬找点情绪出来。",
+            "行，不问了。过来待一会儿就好。",
+            "那就先放这儿。什么时候想说了，再从这里继续。",
+        ))
+
+    if is_emotional_bid(text):
+        return _stable_choice(text, (
+            "怎么了，这一声叹得我有点在意，是发生什么了吗？",
+            "哎，怎么啦，是碰上什么事了？",
+        ))
+
     if emotion:
         feeling = _EMOTION_TEXT.get(emotion, "有些不舒服")
         if emotion == "frustrated":
@@ -264,12 +282,46 @@ def build_grounded_companion_reply(
             return reply + "是会议本身，还是中间某件事特别磨人？"
         return reply
 
-    if any(phrase in text for phrase in ("不想说", "别问了", "算了", "没什么", "没事")):
-        return _stable_choice(text, (
-            "好，那就不说。你不用为了让我有话接，硬找点情绪出来。",
-            "行，不问了。过来待一会儿就好。",
-            "那就先放这儿。什么时候想说了，再从这里继续。",
+    rows = [row for row in memories if isinstance(row, dict)]
+    opening, _focus_id = build_big_whale_opening(rows)
+    fact_opening, _fact_focus_id = build_big_whale_opening([
+        row for row in rows if row.get("layer") != "L3"
+    ])
+    if is_prompt_to_speak(text):
+        if fact_opening:
+            focus = next((row for row in rows if str(row.get("id") or "") == _fact_focus_id), {})
+            project = focus.get("project") if isinstance(focus.get("project"), dict) else {}
+            subject = str(project.get("name") or focus.get("app") or "手头那件事").strip()
+            subject = re.sub(r"[（(][^）)]*DSH[^）)]*[）)]", "", subject, flags=re.IGNORECASE).strip()
+            if "dsh" in subject.lower():
+                return "你今天跟 DSH 较了挺久的劲，它最好争气点。"
+            return f"你今天几乎都泡在 {subject} 里了，它最好值得。"
+        return "你突然把话筒塞我手里，弄得我刚才想的那句话反而跑了。"
+    memory_phrases = (
+        "记得吗", "记得我", "你知道我", "我做了什么", "今天做了", "今天干嘛",
+        "今天都干", "忙了多久", "用了多久", "玩了多久", "看了多久",
+    )
+    asks_about_memory = any(phrase in text for phrase in memory_phrases)
+    if not asks_about_memory and any(phrase in text for phrase in ("我问你啊", "我问你呢", "问你呢")):
+        previous_users = [
+            str(item.get("text") or "") for item in list(conversation or [])[:-1]
+            if isinstance(item, dict) and item.get("role") == "user"
+        ]
+        asks_about_memory = bool(previous_users and any(
+            phrase in previous_users[-1] for phrase in memory_phrases
         ))
+    if asks_about_memory:
+        if fact_opening:
+            return fact_opening
+        return "我现在还没收到小鲸整理好的今日记录，所以不能装作知道。等同步进来，我再认真告诉你。"
+
+    dialogue_state = emotional_dialogue_state(list(conversation or []))
+    if dialogue_state["phase"] == "exploring":
+        if dialogue_state["turn"] == 1:
+            return f"原来是{text.rstrip('。！？!?')}这件事。具体是哪一段让你忍不住叹气了？"
+        if dialogue_state["turn"] == 2:
+            return f"嗯，我跟上了，是{text.rstrip('。！？!?')}。这件事最戳你的地方是什么？"
+        return f"好，我知道你刚才那声叹气是从这里来的：{text.rstrip('。！？!?')}。你继续说，我不急着替你下结论。"
 
     if mentions_meeting:
         duration_stated = bool(re.search(
@@ -283,18 +335,6 @@ def build_grounded_companion_reply(
             ))
         return "嗯，会议这件事我记下了。你是想聊聊它，还是只是顺手告诉我？"
 
-    rows = [row for row in memories if isinstance(row, dict)]
-    opening, _focus_id = build_big_whale_opening(rows)
-    fact_opening, _fact_focus_id = build_big_whale_opening([
-        row for row in rows if row.get("layer") != "L3"
-    ])
-    asks_about_memory = any(
-        phrase in text
-        for phrase in ("记得吗", "记得我", "我做了什么", "今天做了", "忙了多久", "用了多久", "玩了多久", "看了多久")
-    )
-    if asks_about_memory and opening:
-        return opening
-
     if any(phrase in text for phrase in ("下班了", "忙完了", "做完了", "结束工作", "收工了")):
         if fact_opening:
             return f"收工。{fact_opening}"
@@ -304,11 +344,27 @@ def build_grounded_companion_reply(
         ))
 
     return _stable_choice(text, (
-        "嗯，你继续。我跟得上。",
-        "知道了。然后呢？",
-        "好，我在这儿。你慢慢说。",
-        "这句我收到了。你还想往下说吗？",
+        "嗯，这事我先记在这儿。",
+        "哦，原来是这样。",
+        "行，我跟上了。",
+        "好，这段我记住了。",
     ))
+
+
+def is_direct_memory_question(text: str) -> bool:
+    value = str(text or "")
+    return any(phrase in value for phrase in (
+        "记得吗", "记得我", "你知道我", "我做了什么", "今天做了", "今天干嘛",
+        "今天都干", "忙了多久", "用了多久", "玩了多久", "看了多久",
+    ))
+
+
+def is_prompt_to_speak(text: str) -> bool:
+    return bool(re.fullmatch(r"(?:说话|你说|说点什么|讲点啥|陪我说说话)[。！!？?…\s]*", str(text or "").strip()))
+
+
+def is_reaction_to_companion(text: str) -> bool:
+    return bool(re.fullmatch(r"(?:[？?]+|啊[？?]?|哈[？?]?|什么意思[？?]?|你说啥[？?]?)[。！!…\s]*", str(text or "").strip()))
 
 
 class MemorySyncClient:

@@ -36,7 +36,40 @@ def configured_responder() -> ModelCompanionResponder | None:
         not in {"0", "false", "no"},
     )
     responder = ModelCompanionResponder(config)
-    return responder if responder.available else None
+    if responder.available:
+        return responder
+
+    # 本地一体化运行时复用桌宠已经配置并安全保存的模型设置。
+    # 独立部署仍可完全通过 WHALE_LLM_* 环境变量运行。
+    desktop_root = ROOT.parent / "dsh-pet-indesktop"
+    if not desktop_root.is_dir():
+        return None
+    try:
+        if str(desktop_root) not in sys.path:
+            sys.path.insert(0, str(desktop_root))
+        from pet.config import Config
+
+        desktop_config = Config()
+        settings = desktop_config.chat_settings()
+        if not settings.enabled:
+            return None
+        current = settings.active_config
+        provider = ProviderConfig(
+            provider_id=current.provider_id,
+            name=current.name,
+            base_url=current.base_url,
+            chat_path=current.chat_path,
+            model=current.model,
+            api_key=desktop_config.resolve_api_key(current),
+            timeout=current.timeout,
+            temperature=current.temperature,
+            max_tokens=current.max_tokens,
+            verify_ssl=current.verify_ssl,
+        )
+        desktop_responder = ModelCompanionResponder(provider)
+        return desktop_responder if desktop_responder.available else None
+    except Exception:
+        return None
 
 
 def main() -> int:
