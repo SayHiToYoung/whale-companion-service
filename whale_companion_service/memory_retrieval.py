@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 
+from .memory_activation import memory_importance
 from .memory_protocol import memory_time
 
 
@@ -60,19 +61,8 @@ def _searchable_text(memory: dict) -> str:
     return " ".join(str(value or "") for value in fields)
 
 
-def _importance(memory: dict) -> float:
-    explicit = memory.get("importance")
-    if explicit is not None:
-        try:
-            return max(0.0, min(1.0, float(explicit)))
-        except (TypeError, ValueError):
-            pass
-    if memory.get("layer") == "L3":
-        return 0.9
-    if memory.get("layer") == "L2":
-        return 0.7
-    seconds = max(0.0, float(memory.get("durationSeconds") or 0.0))
-    return min(0.8, 0.35 + seconds / 28_800.0)
+# 重要性与激活度共用一份定义：检索排序和"还记不记得"必须对同一条记忆给出同一个重要性。
+_importance = memory_importance
 
 
 def _encoded_size(memory: dict) -> int:
@@ -152,3 +142,10 @@ def select_companion_memories(memories: list[dict], query: str) -> tuple[list[di
         "omittedCount": max(0, len(rows) - len(selected)),
     }
     return selected, trace
+
+
+def memory_topic_relevance(memory: dict, query: str) -> float:
+    """一条记忆和当前话题的重合度，口径与检索排序完全一致。"""
+    words, bigrams = _search_terms(query)
+    _hits, coverage = _relevance(_searchable_text(memory).lower(), words, bigrams)
+    return coverage

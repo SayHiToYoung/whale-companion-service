@@ -225,6 +225,9 @@ def build_grounded_companion_reply(
     lifecycle_transition, _reason = lifecycle_transition_from_text(text)
     if lifecycle_transition == "suppressed":
         return "好，这件事以后不从我这里主动提。"
+    if lifecycle_transition == "corrected":
+        # 记错了就作废重记，不辩解、也不把错的那条留在原地当背景。
+        return "是我记错了，那条我划掉。你说的才算，我按你说的重新记。"
     if lifecycle_transition == "resolved":
         return _stable_choice(text, (
             "那就好。不是非得彻底翻篇，能松一点就很好。",
@@ -443,6 +446,20 @@ class MemorySyncClient:
             "status": status,
             "reason": reason,
         })
+
+    def reinforce_memory(
+        self, *, user_id: str, memory_id: str, message_id: str = "", mention_type: str = "user_recall"
+    ) -> dict:
+        return self._request("POST", "/v1/memory/reinforce", {
+            "userId": user_id,
+            "memoryId": memory_id,
+            "messageId": message_id,
+            "mentionType": mention_type,
+        })
+
+    def memory_digests(self, user_id: str, kind: str = "") -> dict:
+        query = urllib.parse.urlencode({"userId": user_id, "kind": kind})
+        return self._request("GET", f"/v1/memory/digests?{query}")
 
     def post_message(
         self, *, user_id: str, device_id: str, message_id: str, role: str, text: str
