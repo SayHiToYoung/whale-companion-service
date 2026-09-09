@@ -15,6 +15,9 @@ from urllib.parse import parse_qs, urlparse
 from .dialogue_state import emotional_dialogue_state
 from .companion_mind import build_companion_mind, contextual_fallback
 from .companion_runtime import build_companion_frame
+from .companion_runtime.companion_emotion import empty_companion_emotion
+from .companion_runtime.open_threads import build_open_threads
+from .companion_runtime.proactive import decide_proactive_speak
 from .standing_knowledge import derive_standing_knowledge, standing_knowledge_context
 from .emotion import explicit_emotion_label
 from .companion_llm import CompanionResponder
@@ -296,6 +299,12 @@ class MemoryRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(user_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS companion_emotion_state (
+                    user_id TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id)
                 );
             """)
             thread_columns = {row[1] for row in db.execute("PRAGMA table_info(emotional_threads)")}
@@ -1261,6 +1270,7 @@ class MemoryRepository:
                 open_threads = self._open_threads_locked(db, user_id)
                 standing = self._standing_knowledge_locked(db, user_id)
                 persona_state = self._persona_card_locked(db, user_id)
+                companion_emotion = self._companion_emotion_locked(db, user_id)
                 confirmed_rows = db.execute(
                     """SELECT insight_json FROM insight_reviews
                        WHERE user_id=? AND status='confirmed' ORDER BY updated_at DESC LIMIT 20""",
@@ -1292,7 +1302,7 @@ class MemoryRepository:
             profile["companionFrame"] = build_companion_frame(
                 user_text=user_text, conversation=conversation, memories=memories,
                 user_facts=user_facts, boundaries=boundaries, persona=persona_state["active"],
-                threads=open_threads,
+                threads=open_threads, companion_emotion=companion_emotion,
             )
             fallback_kind = "grounded_memory" if is_direct_memory_question(user_text) else "contextual"
             transition, _transition_reason = lifecycle_transition_from_text(user_text)
@@ -1386,10 +1396,77 @@ class MemoryRepository:
                         db, user_id=user_id, memory_id=focus_memory_id,
                         message_id=reply_id, mention_type="reply", now=reply_time,
                     )
+                next_emotion = profile["companionFrame"].get("companionEmotionNext")
+                if isinstance(next_emotion, dict):
+                    self._persist_companion_emotion_locked(db, user_id, next_emotion, reply_time)
             with self._status_lock:
                 self._last_reply_source = reply_source
                 self._last_reply_at = reply_time
             return self._message_payload(stored), reply_source
+
+    @staticmethod
+    def _companion_emotion_locked(db: sqlite3.Connection, user_id: str) -> dict:
+        row = db.execute(
+            "SELECT state_json FROM companion_emotion_state WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return empty_companion_emotion()
+        try:
+            return json.loads(row["state_json"])
+        except (ValueError, TypeError):
+            return empty_companion_emotion()
+
+    @staticmethod
+    def _persist_companion_emotion_locked(db: sqlite3.Connection, user_id: str, state: dict, now: str) -> None:
+        db.execute(
+            """INSERT INTO companion_emotion_state (user_id, state_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 state_json=excluded.state_json, updated_at=excluded.updated_at""",
+            (user_id, canonical_json(state), now),
+        )
+
+    def companion_emotion(self, user_id: str) -> dict:
+        if not str(user_id).strip():
+            raise ProtocolError("userId required")
+        with self._connect() as db:
+            return self._companion_emotion_locked(db, user_id)
+
+    def proactive_decision(self, user_id: str, activity: str = "idle") -> dict:
+        if not str(user_id).strip():
+            raise ProtocolError("userId required")
+        with self._connect() as db:
+            last_spoke = db.execute(
+                """SELECT created_at FROM conversation_messages
+                   WHERE user_id=? AND role='assistant' ORDER BY message_seq DESC LIMIT 1""",
+                (user_id,),
+            ).fetchone()
+            last_user = db.execute(
+                """SELECT created_at FROM conversation_messages
+                   WHERE user_id=? AND role='user' ORDER BY message_seq DESC LIMIT 1""",
+                (user_id,),
+            ).fetchone()
+            open_threads = build_open_threads(self._open_threads_locked(db, user_id))
+            memory_rows = db.execute(
+                "SELECT server_seq, payload_json FROM memory_events WHERE user_id=? ORDER BY server_seq DESC LIMIT 200",
+                (user_id,),
+            ).fetchall()
+            memories = self._decorate_memory_rows(db, user_id, list(reversed(memory_rows)))
+        speakable = [memory for memory in memories if memory_is_speakable(memory)]
+        opening, _focus_id = build_big_whale_opening(speakable)
+        hour = datetime.now().hour
+        period = "late_night" if hour < 6 else "morning" if hour < 11 else "daytime" if hour < 18 else "evening"
+        return decide_proactive_speak(
+            last_spoke_at=last_spoke["created_at"] if last_spoke else None,
+            last_user_message_at=last_user["created_at"] if last_user else None,
+            period=period,
+            activity=activity,
+            pending_follow_ups=open_threads.get("pendingFollowUps") or [],
+            carried_emotion=str(open_threads.get("carriedEmotion") or ""),
+            carried_weight=float(open_threads.get("carriedWeight") or 0.0),
+            opening=opening,
+        )
 
     def companion_status(self) -> dict:
         responder = self.responder
@@ -1958,6 +2035,21 @@ class MemoryApiServer:
                     return
                 if self.command == "POST" and parsed.path == "/v1/insight-drafts/actions":
                     self._json(200, repository.review_insight(self._body()))
+                    return
+                if self.command == "GET" and parsed.path == "/v1/companion/proactive":
+                    query = parse_qs(parsed.query)
+                    user_id = str((query.get("userId") or [""])[0]).strip()
+                    if not user_id:
+                        raise ProtocolError("userId required")
+                    activity = str((query.get("activity") or ["idle"])[0]).strip() or "idle"
+                    self._json(200, repository.proactive_decision(user_id, activity))
+                    return
+                if self.command == "GET" and parsed.path == "/v1/companion/emotion":
+                    query = parse_qs(parsed.query)
+                    user_id = str((query.get("userId") or [""])[0]).strip()
+                    if not user_id:
+                        raise ProtocolError("userId required")
+                    self._json(200, repository.companion_emotion(user_id))
                     return
                 if self.command == "GET" and parsed.path == "/v1/persona-card":
                     query = parse_qs(parsed.query)
