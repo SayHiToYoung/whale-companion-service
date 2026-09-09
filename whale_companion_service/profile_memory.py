@@ -14,6 +14,19 @@ def stable_id(prefix: str, *parts: str) -> str:
     return f"{prefix}_{hashlib.sha256(raw).hexdigest()[:24]}"
 
 
+# 句末语气词。用户说“别再提健身房了”，要屏蔽的话题是“健身房”，不是“健身房了”——
+# 带着语气词的词条永远匹配不上真正的记忆内容，边界会静默失效。
+_TRAILING_PARTICLES = re.compile(r"(?:[了吧啊呢吗呀嘛哦噢喔嗯])+$")
+
+
+def _boundary_term(raw: str) -> str:
+    """把用户随口说的一段话收敛成可用于匹配的词条。"""
+    term = " ".join(str(raw or "").split()).strip("“”「」\"' ")
+    stripped = _TRAILING_PARTICLES.sub("", term).strip()
+    # 全是语气词时保留原词，宁可宽一点也不要产出空边界。
+    return stripped or term
+
+
 def extract_profile_memories(text: str) -> dict[str, list[dict]]:
     """Extract only explicit, high-precision statements from a user message."""
     source = " ".join(str(text or "").split())
@@ -34,16 +47,29 @@ def extract_profile_memories(text: str) -> dict[str, list[dict]]:
         })
 
     for match in re.finditer(r"(?:不要|别)(?:再)?(?:叫我)\s*([^，。！？!?]{1,20})", source):
-        boundaries.append({
-            "kind": "addressing",
-            "rule": f"不要称呼用户为“{match.group(1).strip()}”。",
-            "priority": 100,
-        })
+        term = _boundary_term(match.group(1))
+        if term:
+            boundaries.append({
+                "kind": "addressing",
+                "rule": f"不要称呼用户为“{term}”。",
+                "priority": 100,
+            })
     for match in re.finditer(r"(?:不要|别)再提\s*([^，。！？!?]{1,40})", source):
+        term = _boundary_term(match.group(1))
+        if term:
+            boundaries.append({
+                "kind": "topic_suppression",
+                "rule": f"不要主动提起“{term}”。",
+                "priority": 100,
+            })
+    # "别主动找我"是对行为本身的限制，不是对某个话题的限制，必须单独识别——
+    # 否则它只会被当成一句普通的抱怨，关系照旧、主动照旧。
+    if re.search(r"(?:(?:不要|别)(?:再)?(?:主动)?(?:找|联系|打扰|烦)我|免打扰|别来烦我|别理我)", source):
         boundaries.append({
-            "kind": "topic_suppression",
-            "rule": f"不要主动提起“{match.group(1).strip()}”。",
+            "kind": "contact",
+            "rule": "不要主动联系用户；除非用户先开口，否则保持安静。",
             "priority": 100,
+            "blockProactive": True,
         })
     return {"facts": facts, "boundaries": boundaries}
 
