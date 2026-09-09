@@ -26,8 +26,8 @@ def test_compile_emits_reactions_and_stages():
     assert "开心时" in compiled
     assert "看到你熬夜时" in compiled
     assert "随关系阶段的说话方式" in compiled
-    assert "刚认识" in compiled
-    assert "很亲近" in compiled
+    assert "初识" in compiled
+    assert "深度联结" in compiled
 
 
 def test_custom_card_can_override_reactions():
