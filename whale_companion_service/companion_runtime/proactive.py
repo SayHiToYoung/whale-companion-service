@@ -30,6 +30,10 @@ PROACTIVE_MIN_INTERVAL_MINUTES = 15.0   # 两次主动至少隔 15 分钟
 FOLLOW_UP_WEIGHT_FLOOR = 0.25           # 约定权重低于此值视为已过期，不再主动
 CARRIED_WEIGHT_FLOOR = 0.25             # 情绪线程权重低于此值不再主动提起
 
+# 关系越近，主动开口越放得开：间隔更短、情绪线程更容易触发主动。
+_STAGE_MIN_INTERVAL_MINUTES = {"early": 45.0, "warming": 30.0, "familiar": 15.0}
+_STAGE_CARRIED_FLOOR = {"early": 0.6, "warming": 0.4, "familiar": 0.25}
+
 # 免打扰时段：深夜默认不主动，除非有到期约定要兑现。
 _QUIET_PERIODS = ("late_night",)
 
@@ -84,6 +88,7 @@ def decide_proactive_speak(
     carried_emotion: str = "",
     carried_weight: float = 0.0,
     opening: str = "",
+    relationship_stage: str = "familiar",
 ) -> dict:
     """判断大鲸此刻是否应该主动开口，以及开口的依据。
 
@@ -93,13 +98,15 @@ def decide_proactive_speak(
     checked_at = moment.isoformat()
     follow_ups = [row for row in (pending_follow_ups or []) if isinstance(row, dict)]
     due = _due_follow_up(follow_ups)
+    min_interval = _STAGE_MIN_INTERVAL_MINUTES.get(relationship_stage, PROACTIVE_MIN_INTERVAL_MINUTES)
+    carried_floor = _STAGE_CARRIED_FLOOR.get(relationship_stage, CARRIED_WEIGHT_FLOOR)
 
     # 闸门：硬规则，一条触发即否决（顺序即优先级）。
     silence = _minutes_since(last_user_message_at, moment)
     if activity == "active" and silence is not None and silence < ACTIVE_MIN_SILENCE_MINUTES:
         return _veto("user_still_chatting", checked_at)
     since_spoke = _minutes_since(last_spoke_at, moment)
-    if since_spoke is not None and since_spoke < PROACTIVE_MIN_INTERVAL_MINUTES:
+    if since_spoke is not None and since_spoke < min_interval:
         return _veto("too_soon", checked_at)
     if period in _QUIET_PERIODS and due is None:
         return _veto("quiet_hours", checked_at)
@@ -107,7 +114,7 @@ def decide_proactive_speak(
     # 候选：按优先级取第一个有据可依的开口理由。
     if due:
         return _speak("follow_up", "due_follow_up", str(due.get("hint") or due.get("topic") or ""), checked_at)
-    if carried_emotion and carried_weight >= CARRIED_WEIGHT_FLOOR:
+    if carried_emotion and carried_weight >= carried_floor:
         return _speak("check_in", "open_emotion_thread", carried_emotion, checked_at)
     if opening:
         return _speak("observation", "grounded_opening", opening, checked_at)

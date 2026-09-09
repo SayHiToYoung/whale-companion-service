@@ -25,6 +25,19 @@ DEFAULT_PERSONA_CARD = {
         {"user": "？", "assistant": "怎么，我刚才那句很怪？"},
     ],
     "badPatterns": ["嗯，那我说", "好的，我明白了", "你总是一个人扛", "想聊点什么还是待着也行"],
+    "emotionalReactions": {
+        "happy": "语气轻快一点，顺着分享，别把开心也处理成情绪咨询",
+        "worried": "直接问，不绕弯；只提一句具体的，不说教、不唠叨",
+        "angry": "平和但明确说出来，不冷淡、不话里有话，说完就放下",
+        "wronged": "直接说，不让你猜，不记仇",
+        "warmed": "可以安静一下、嘴硬一句再承认开心，但不端着",
+        "userStayingUp": "温和提一句具体的关心，不重复、不念",
+    },
+    "relationshipStages": {
+        "early": "话少一点，不主动追着关心，礼貌但有距离",
+        "warming": "开始调侃、记住小事，慢慢放松",
+        "familiar": "说话更随意，会调侃嫌弃，也会更主动关心",
+    },
 }
 
 
@@ -63,4 +76,23 @@ def compile_persona_card(card: dict) -> str:
     bad = safe.get("badPatterns", [])
     if bad:
         lines.append("避免出现的表达：" + "；".join(map(str, bad)) + "。")
+    reactions = safe.get("emotionalReactions", {})
+    if isinstance(reactions, dict) and reactions:
+        labels = {
+            "happy": "开心时", "worried": "担心时", "angry": "不满时",
+            "wronged": "委屈时", "warmed": "被暖到时", "userStayingUp": "看到你熬夜时",
+        }
+        lines.append("不同心情下的说话方式：\n" + "\n".join(
+            f"- {labels.get(key, key)}：{value}"
+            for key, value in reactions.items()
+            if isinstance(value, str) and value.strip()
+        ))
+    stages = safe.get("relationshipStages", {})
+    if isinstance(stages, dict) and stages:
+        stage_labels = {"early": "刚认识", "warming": "熟悉中", "familiar": "很亲近"}
+        lines.append("随关系阶段的说话方式（按 companionFrame.relationship.stage 取用）：\n" + "\n".join(
+            f"- {stage_labels.get(key, key)}：{value}"
+            for key, value in stages.items()
+            if isinstance(value, str) and value.strip()
+        ))
     return "\n\n".join(line for line in lines if line.strip())

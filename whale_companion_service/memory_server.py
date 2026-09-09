@@ -1447,6 +1447,10 @@ class MemoryRepository:
                    WHERE user_id=? AND role='user' ORDER BY message_seq DESC LIMIT 1""",
                 (user_id,),
             ).fetchone()
+            user_turn_count = db.execute(
+                "SELECT COUNT(*) FROM conversation_messages WHERE user_id=? AND role='user'",
+                (user_id,),
+            ).fetchone()[0]
             open_threads = build_open_threads(self._open_threads_locked(db, user_id))
             memory_rows = db.execute(
                 "SELECT server_seq, payload_json FROM memory_events WHERE user_id=? ORDER BY server_seq DESC LIMIT 200",
@@ -1457,6 +1461,7 @@ class MemoryRepository:
         opening, _focus_id = build_big_whale_opening(speakable)
         hour = datetime.now().hour
         period = "late_night" if hour < 6 else "morning" if hour < 11 else "daytime" if hour < 18 else "evening"
+        stage = "familiar" if user_turn_count >= 12 else "warming" if user_turn_count >= 4 else "early"
         return decide_proactive_speak(
             last_spoke_at=last_spoke["created_at"] if last_spoke else None,
             last_user_message_at=last_user["created_at"] if last_user else None,
@@ -1466,6 +1471,7 @@ class MemoryRepository:
             carried_emotion=str(open_threads.get("carriedEmotion") or ""),
             carried_weight=float(open_threads.get("carriedWeight") or 0.0),
             opening=opening,
+            relationship_stage=stage,
         )
 
     def companion_status(self) -> dict:

@@ -86,3 +86,42 @@ def test_stale_follow_up_ignored():
         pending_follow_ups=[{"hint": "过两天再问我", "weight": 0.1}],
     )
     assert result["vetoReason"] == "nothing_grounded"
+
+
+def test_early_stage_needs_longer_interval():
+    # early 阶段间隔 45 分钟：20 分钟前开口过 → 仍 too_soon
+    result = decide_proactive_speak(
+        now=NOW, last_spoke_at=_ago(20), activity="idle", period="daytime",
+        relationship_stage="early",
+    )
+    assert result["vetoReason"] == "too_soon"
+
+
+def test_familiar_stage_allows_shorter_interval():
+    # familiar 阶段间隔 15 分钟：20 分钟前开口过 → 不再 too_soon
+    result = decide_proactive_speak(
+        now=NOW, last_spoke_at=_ago(20), activity="idle", period="daytime",
+        relationship_stage="familiar",
+    )
+    assert result["vetoReason"] != "too_soon"
+
+
+def test_early_stage_needs_stronger_emotion_thread():
+    # early 阶段 carried 阈值 0.6：weight=0.4 不足以触发 check_in
+    result = decide_proactive_speak(
+        now=NOW, activity="idle", period="evening",
+        carried_emotion="难过", carried_weight=0.4,
+        relationship_stage="early",
+    )
+    assert result["vetoReason"] == "nothing_grounded"
+
+
+def test_familiar_stage_triggers_check_in_on_weaker_thread():
+    # familiar 阶段 carried 阈值 0.25：weight=0.4 足够触发 check_in
+    result = decide_proactive_speak(
+        now=NOW, activity="idle", period="evening",
+        carried_emotion="难过", carried_weight=0.4,
+        relationship_stage="familiar",
+    )
+    assert result["shouldSpeak"] is True
+    assert result["kind"] == "check_in"
