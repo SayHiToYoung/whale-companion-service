@@ -170,3 +170,56 @@ def companion_emotion_context(state: dict) -> dict:
         "arousal": arousal,
         "calm": calm,
     }
+
+
+def judge_companion_emotion(current: dict, user_text: str, user_emotion: str, judge=None, now=None):
+    """LLM 判定她此刻的心情（心脏）；judge 为 None 或失败时回退到确定性规则。
+
+    judge 是可调用 judge(task, context, fields, fallback) -> (result, source)。
+    LLM 产出的是「她此刻真实的感觉」（带不确定性），确定性只保留「惰性混合 +
+    衰减」这一层身体惯性——她不会瞬间切换情绪，但情绪本身由 LLM 感觉，不靠 regex。
+    返回 (state, source)，source ∈ {"model", "fallback"}。
+    """
+    moment = now or datetime.now(timezone.utc)
+    fallback = update_companion_emotion(current, user_text, user_emotion, now=moment)
+    if judge is None:
+        return fallback, "fallback"
+    try:
+        result, source = judge(
+            task="判断陪伴者此刻的真实心情",
+            context={
+                "userText": str(user_text or "")[:400],
+                "userEmotion": user_emotion,
+                "currentMood": str((current or {}).get("mood") or ""),
+            },
+            fields={
+                "mood": "一句话描述她此刻的心情（可以没有感觉，输出空字符串）",
+                "valence": "-1 到 1 的正负向，-1 很不好，+1 很好",
+                "arousal": "0 到 1 的唤醒度，0 平静，1 兴奋/紧绷",
+            },
+            fallback={"mood": fallback["mood"], "valence": fallback["valence"], "arousal": fallback["arousal"]},
+        )
+    except Exception:
+        return fallback, "fallback"
+    raw_v = max(-1.0, min(1.0, float(result.get("valence", fallback["valence"]))))
+    raw_a = max(0.0, min(1.0, float(result.get("arousal", fallback["arousal"]))))
+    mood = str(result.get("mood") or "")
+    # 身体惯性：LLM 是「感觉」，旧状态 + 衰减是「身体」，她不能瞬间换心情。
+    state = empty_companion_emotion() if not isinstance(current, dict) else dict(current)
+    valence = max(-1.0, min(1.0, float(state.get("valence") or 0.0)))
+    arousal = max(0.0, min(1.0, float(state.get("arousal") or BASELINE_AROUSAL)))
+    hours = _hours_since(state.get("updatedAt"), moment)
+    valence = _decay_toward(valence, BASELINE_VALENCE, hours)
+    arousal = _decay_toward(arousal, BASELINE_AROUSAL, hours)
+    valence = BLEND_NEW_WEIGHT * raw_v + (1.0 - BLEND_NEW_WEIGHT) * valence
+    arousal = BLEND_NEW_WEIGHT * raw_a + (1.0 - BLEND_NEW_WEIGHT) * arousal
+    if _is_calm(valence, arousal):
+        mood = ""
+    return {
+        "version": EMOTION_STATE_VERSION,
+        "mood": mood,
+        "valence": round(max(-1.0, min(1.0, valence)), 4),
+        "arousal": round(max(0.0, min(1.0, arousal)), 4),
+        "lastEvent": "llm_judged",
+        "updatedAt": moment.isoformat(),
+    }, source

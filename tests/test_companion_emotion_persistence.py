@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from whale_companion_service.companion_runtime.proactive import CANDIDATE_BASE_SCORE
 from whale_companion_service.memory_server import MemoryRepository
 
 
@@ -50,23 +51,30 @@ def test_reply_persists_companion_emotion(tmp_path: Path) -> None:
     assert state["lastEvent"] == "warmed"
 
 
+def _quiet_clock():
+    """深夜的固定时钟。主动决策依赖"现在几点"，不钉住它这两条断言会随运行时刻漂移。"""
+    local = datetime.now().astimezone().tzinfo
+    return lambda: datetime(2026, 5, 1, 3, 0, tzinfo=local)
+
+
 def test_proactive_decision_empty_is_quiet(tmp_path: Path) -> None:
-    repository = MemoryRepository(tmp_path / "proactive.sqlite3")
+    repository = MemoryRepository(tmp_path / "proactive.sqlite3", clock=_quiet_clock())
     result = repository.proactive_decision("user-1", "idle")
     assert result["shouldSpeak"] is False
     assert result["vetoReason"] == "nothing_grounded"
 
 
 def test_proactive_decision_returns_valid_structure(tmp_path: Path) -> None:
-    repository = MemoryRepository(tmp_path / "proactive-structure.sqlite3")
+    repository = MemoryRepository(tmp_path / "proactive-structure.sqlite3", clock=_quiet_clock())
     repository.ingest_batch(_batch())
     result = repository.proactive_decision("user-1", "idle")
     assert "shouldSpeak" in result
     assert "checkedAt" in result
     if result["shouldSpeak"]:
-        assert result["kind"] in {"follow_up", "check_in", "observation"}
+        assert result["kind"] in CANDIDATE_BASE_SCORE
         assert result["content"]
     else:
         assert result["vetoReason"] in {
-            "user_still_chatting", "too_soon", "quiet_hours", "nothing_grounded",
+            "user_still_chatting", "user_resting", "too_soon", "quiet_hours",
+            "nothing_grounded", "care_not_permitted", "shared_memory_not_permitted",
         }
