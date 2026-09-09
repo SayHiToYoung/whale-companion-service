@@ -347,6 +347,131 @@ function renderInsightDrafts(service) {
   }
 }
 
+const STAGE_LABELS = {
+  deeply_distant: "极度疏离", strongly_distant: "强烈疏离", distant: "疏离",
+  acquaintance: "初识", familiar: "熟悉", close: "亲近", intimate: "亲密", deeply_bonded: "深度联结",
+};
+const STAGE_RANGES = [
+  ["deeply_distant", -1200, -801], ["strongly_distant", -800, -401], ["distant", -400, -1],
+  ["acquaintance", 0, 199], ["familiar", 200, 599], ["close", 600, 899], ["intimate", 900, 1199], ["deeply_bonded", 1200, 1200],
+];
+
+function renderLiving(service) {
+  const living = service?.living || {};
+  const affinity = living.affinity || {};
+  const daily = living.daily || {};
+  const chronotype = living.chronotype || {};
+  const timeline = living.timeline || [];
+  const expressions = living.expressions || [];
+  const config = living.config || {};
+
+  $("#affinity-stage").textContent = `${STAGE_LABELS[affinity.stage] || affinity.stage || "?"} · ${affinity.score ?? 0} 分 · ${affinity.interaction || "?"}`;
+  const stageRoot = $("#affinity-stages"); stageRoot.replaceChildren();
+  for (const [key, min, max] of STAGE_RANGES) {
+    const item = document.createElement("article"); item.className = "memory-row";
+    if (affinity.stage === key) item.style.outline = "1px solid var(--accent, #5b8def)";
+    const title = document.createElement("strong"); title.textContent = `${STAGE_LABELS[key]}`;
+    const detail = document.createElement("p"); detail.className = "memory-detail";
+    detail.textContent = `${key} · ${min} ~ ${max} 分`;
+    item.append(title, detail); stageRoot.append(item);
+  }
+
+  $("#daily-period").textContent = daily.period || "-";
+  const dailyNode = $("#living-daily-summary");
+  dailyNode.className = "summary";
+  dailyNode.textContent = daily.energy != null
+    ? `精力 ${daily.energy}/100${daily.moodBias ? ` · 心情底色「${daily.moodBias}」` : ""} · 活跃窗 ${daily.activeWindow ? "是" : "否"}`
+    : "尚未读取。";
+  const condRoot = $("#daily-conditions"); condRoot.replaceChildren();
+  if (!(daily.conditions || []).length) condRoot.textContent = "今天还没有状态条件。";
+  for (const c of (daily.conditions || [])) {
+    const item = document.createElement("article"); item.className = "memory-row";
+    const title = document.createElement("strong"); title.textContent = `${c.title || c.kind}：${c.label || ""}`;
+    const detail = document.createElement("p"); detail.className = "memory-detail";
+    detail.textContent = `精力 ${Number(c.energyDelta) > 0 ? "+" : ""}${c.energyDelta} · ${c.mood || "无情绪"} · ${c.cause || ""}`;
+    item.append(title, detail); condRoot.append(item);
+  }
+  if (document.activeElement !== $("#chrono-wake")) $("#chrono-wake").value = chronotype.wakeMinute ?? 450;
+  if (document.activeElement !== $("#chrono-sleep")) $("#chrono-sleep").value = chronotype.sleepMinute ?? 1350;
+
+  $("#expr-count").textContent = `${expressions.length} 条`;
+  const exprRoot = $("#expression-rules"); exprRoot.replaceChildren();
+  if (!expressions.length) exprRoot.textContent = "还没有学到的表达。";
+  for (const rule of expressions) {
+    const item = document.createElement("article"); item.className = "memory-row";
+    const title = document.createElement("strong"); title.textContent = `「${rule.pattern}」 · ${rule.scene}`;
+    const detail = document.createElement("p"); detail.className = "memory-detail";
+    detail.textContent = `状态 ${rule.status} · 已用 ${rule.usageCount || 0} 次`;
+    const actions = document.createElement("div"); actions.className = "memory-actions";
+    if (rule.status === "pending") {
+      for (const [decision, label] of [["approved", "通过"], ["rejected", "拒绝"]]) {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = label;
+        b.addEventListener("click", () => expressionAction(rule.id, decision)); actions.append(b);
+      }
+    }
+    const del = document.createElement("button"); del.type = "button"; del.textContent = "删除";
+    del.addEventListener("click", () => expressionAction(rule.id, "delete")); actions.append(del);
+    item.append(title, detail, actions); exprRoot.append(item);
+  }
+
+  $("#timeline-count").textContent = `${timeline.length} 条`;
+  const tlRoot = $("#self-timeline"); tlRoot.replaceChildren();
+  if (!timeline.length) tlRoot.textContent = "还没有自我时间线事件。";
+  for (const ev of timeline) {
+    const item = document.createElement("article"); item.className = "memory-row";
+    const title = document.createElement("strong"); title.textContent = `${ev.when || ""} · ${ev.summary || ev.type}`;
+    const detail = document.createElement("p"); detail.className = "memory-detail";
+    detail.textContent = `${ev.type} · ${ev.status}`;
+    const actions = document.createElement("div"); actions.className = "memory-actions";
+    const del = document.createElement("button"); del.type = "button"; del.textContent = "删除";
+    del.addEventListener("click", () => timelineAction(ev.id)); actions.append(del);
+    item.append(title, detail, actions); tlRoot.append(item);
+  }
+
+  if (document.activeElement !== $("#cfg-daily-limit")) $("#cfg-daily-limit").value = config?.proactive?.dailyLimit ?? 8;
+  if (document.activeElement !== $("#cfg-min-interval")) $("#cfg-min-interval").value = config?.proactive?.minIntervalMinutes ?? 15;
+  if (document.activeElement !== $("#cfg-expr-enabled")) $("#cfg-expr-enabled").checked = config?.expressionLearning?.enabled !== false;
+}
+
+async function expressionAction(ruleId, decision) {
+  const isDelete = decision === "delete";
+  const body = isDelete ? { userId: settings().userId, ruleId } : { userId: settings().userId, ruleId, decision };
+  const path = isDelete ? "/v1/companion/expressions/delete" : "/v1/companion/expressions/review";
+  try { setStatus("正在更新表达。"); await serviceApi(path, { method: "POST", body: JSON.stringify(body) }); setStatus("表达已更新。", "ok"); await refresh(); }
+  catch (error) { setStatus(error.message, "error"); }
+}
+
+async function timelineAction(eventId) {
+  try { setStatus("正在删除时间线事件。"); await serviceApi("/v1/companion/self-timeline/delete", { method: "POST", body: JSON.stringify({ userId: settings().userId, eventId }) }); setStatus("已删除。", "ok"); await refresh(); }
+  catch (error) { setStatus(error.message, "error"); }
+}
+
+async function adjustAffinity(payload) {
+  try { setStatus("正在调整好感度。"); await serviceApi("/v1/companion/affinity/adjust", { method: "POST", body: JSON.stringify({ userId: settings().userId, ...payload }) }); setStatus("好感度已更新。", "ok"); await refresh(); }
+  catch (error) { setStatus(error.message, "error"); }
+}
+
+async function saveChronotype() {
+  try {
+    const wake = parseInt($("#chrono-wake").value, 10); const sleep = parseInt($("#chrono-sleep").value, 10);
+    setStatus("正在保存作息。");
+    await serviceApi("/v1/companion/chronotype", { method: "POST", body: JSON.stringify({ userId: settings().userId, wakeMinute: wake, sleepMinute: sleep }) });
+    setStatus("作息已保存。", "ok"); await refresh();
+  } catch (error) { setStatus(error.message, "error"); }
+}
+
+async function saveLivingConfig() {
+  try {
+    const config = {
+      proactive: { dailyLimit: parseInt($("#cfg-daily-limit").value, 10), minIntervalMinutes: parseInt($("#cfg-min-interval").value, 10) },
+      expressionLearning: { enabled: $("#cfg-expr-enabled").checked },
+    };
+    setStatus("正在保存配置。");
+    await serviceApi("/v1/companion/living-config", { method: "POST", body: JSON.stringify({ userId: settings().userId, config }) });
+    setStatus("配置已保存。", "ok"); await refresh();
+  } catch (error) { setStatus(error.message, "error"); }
+}
+
 function render() {
   const desktopMemories = [
     ...(state.desktop?.collector?.facts || []),
@@ -363,6 +488,7 @@ function render() {
   renderRelationship(state.service);
   renderProfileMemories(state.service);
   renderInsightDrafts(state.service);
+  renderLiving(state.service);
   renderPipeline();
   const health = $("#health");
   const both = Boolean(state.desktop && state.service);
@@ -435,6 +561,21 @@ $("#preview-persona").addEventListener("click", async () => {
 });
 $("#save-settings").addEventListener("click", () => { saveSettings(); refresh(); });
 $("#episode-date").addEventListener("change", () => { state.opening = null; refresh(); });
+
+// 活着的陪伴控制台
+$("#affinity-set").addEventListener("click", () => {
+  const score = parseInt($("#affinity-score").value, 10);
+  if (Number.isNaN(score)) { setStatus("先填一个 -1200~1200 的分数。", "error"); return; }
+  adjustAffinity({ score });
+});
+$("#affinity-plus").addEventListener("click", () => adjustAffinity({ delta: 20 }));
+$("#affinity-minus").addEventListener("click", () => adjustAffinity({ delta: -20 }));
+$("#affinity-reset").addEventListener("click", async () => {
+  if (!confirm("确定把好感度重置回「初识 0 分」吗？")) return;
+  await adjustAffinity({ reset: true });
+});
+$("#chrono-save").addEventListener("click", saveChronotype);
+$("#cfg-save").addEventListener("click", saveLivingConfig);
 
 applySettings();
 $("#episode-date").value = new Date().toLocaleDateString("sv-SE");

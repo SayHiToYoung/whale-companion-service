@@ -134,6 +134,53 @@
       <div id="insight-drafts" class="data-list"></div>
     </section>
 
+    <section class="persona" aria-labelledby="living-title">
+      <div class="section-heading">
+        <div><h2 id="living-title">活着的陪伴</h2><p>好感度、生活节律、表达学习、自我时间线——都能在这里直接调，改完立即生效。</p></div>
+      </div>
+      <div class="workbench">
+        <div class="panel">
+          <div class="panel-heading"><h3>好感度</h3><span id="affinity-stage">-</span></div>
+          <div id="affinity-summary" class="summary empty">尚未读取。</div>
+          <div id="affinity-stages" class="data-list"></div>
+          <div class="memory-actions">
+            <input id="affinity-score" type="number" min="-1200" max="1200" step="1" placeholder="设分 -1200~1200">
+            <button id="affinity-set" type="button">直接设分</button>
+            <button id="affinity-plus" type="button">+20</button>
+            <button id="affinity-minus" type="button">-20</button>
+            <button id="affinity-reset" class="danger" type="button">重置</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-heading"><h3>生活连续性</h3><span id="daily-period">-</span></div>
+          <div id="living-daily-summary" class="summary empty">尚未读取。</div>
+          <div id="daily-conditions" class="data-list"></div>
+          <div class="fields">
+            <label><span>醒（分钟自午夜）</span><input id="chrono-wake" type="number" min="0" max="1439"></label>
+            <label><span>睡（分钟自午夜）</span><input id="chrono-sleep" type="number" min="0" max="1439"></label>
+            <button id="chrono-save" class="quiet" type="button">保存作息</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-heading"><h3>表达学习</h3><span id="expr-count">0 条</span></div>
+          <div id="expression-rules" class="data-list"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-heading"><h3>自我时间线</h3><span id="timeline-count">0 条</span></div>
+          <div id="self-timeline" class="data-list"></div>
+        </div>
+      </div>
+      <details>
+        <summary>主动与学习配置</summary>
+        <div class="fields">
+          <label><span>每日主动上限</span><input id="cfg-daily-limit" type="number" min="0" max="100"></label>
+          <label><span>最小主动间隔（分钟）</span><input id="cfg-min-interval" type="number" min="1" max="240"></label>
+          <label class="check"><span>从对话自动学习表达</span><input id="cfg-expr-enabled" type="checkbox"></label>
+        </div>
+        <button id="cfg-save" class="quiet" type="button">保存配置</button>
+      </details>
+    </section>
+
     <section class="settings" aria-labelledby="settings-title">
       <div class="section-heading"><div><h2 id="settings-title">本地连接</h2><p>设置只保存在当前浏览器。</p></div></div>
       <div class="fields">
