@@ -38,7 +38,7 @@ def build_companion_mind(user_text: str, conversation: list[dict]) -> dict:
     elif _REPAIR.fullmatch(text):
         intent, action = "repair", "repair_and_answer_previous"
     elif is_explicit_stop(text):
-        intent, action = "boundary", "respect_or_lightly_pivot"
+        intent, action = "boundary", "respect_boundary"
     elif is_emotional_bid(text):
         intent, action = "emotional_bid", "lean_in"
     elif _QUESTION.search(text):
@@ -69,25 +69,52 @@ def build_companion_mind(user_text: str, conversation: list[dict]) -> dict:
     }
 
 
-def contextual_fallback(user_text: str, conversation: list[dict], mind: dict) -> str:
+def contextual_fallback(user_text: str, conversation: list[dict], mind: dict, decision: dict | None = None) -> str:
     """Last-resort language for provider failure; never mechanically paraphrase input."""
     text = str(user_text or "").strip()
     intent = str(mind.get("intent") or "")
     previous_assistant = str(mind.get("previousCompanionTurn") or "")
+    if decision is None:
+        from .companion_runtime.shared_scene import build_shared_scene
+        from .companion_runtime.turn_decision import build_turn_decision
+        decision = build_turn_decision(build_shared_scene(text, conversation), {"signal": ""})
+    if decision.get("conversationMove") in {"close", "hold"}:
+        return "好，这件事先放下。我不往下问了。" if intent == "boundary" or is_explicit_stop(text) else "这句话我会认真对待，不急着替你下结论。"
     if intent == "repair":
         return "对，你是在问我。刚才是我没接住，不怪你没说清楚。"
     if intent == "prompt_to_speak":
-        return "你今天和 DSH 较上劲的时间，比留给我的多多了。"
+        return "我有个偏心：比起把一天安排得很满，我更喜欢给无聊留个位置。有趣的小事经常是从那里冒出来的。"
     if intent == "reaction_to_companion":
-        return "怎么，我刚才那句很怪？"
+        return "怎么，我刚才那句很怪？" if not any("？" in str(row.get("text", "")) or "?" in str(row.get("text", "")) for row in conversation[-5:] if row.get("role") == "assistant") else "我刚才那句说得有点绕。我是想接着你的话，不是替你下结论。"
     if intent == "boundary":
-        return "行，到这儿。换个别的也可以。"
-    if intent == "contextual_reply" and previous_assistant:
-        if text.startswith("算了"):
-            return "行，那一页先合上。"
-        return "嗯，这句我接到了。"
+        return "行，这件事先放下。我不往下问了。"
     if intent == "question":
         return "这个我现在答不上来，硬编就更不像话了。"
-    if intent == "continuation":
-        return "等下——你是在接刚才那件事，对吧？"
-    return "哦，这句有点意思。"
+    if decision.get("conversationMove") == "pivot":
+        return "换个小话题。我偏爱有点生活声的地方，比如窗边听得到雨声的座位，比完全安静更自在。"
+    if intent == "emotional_bid":
+        return "怎么了，刚才是哪件事让你叹了这口气？" if decision.get("askQuestion") else "不用把这口气马上变成一份解释。说得零碎一点也没关系。"
+    emotion = explicit_emotion_label(text)
+    if emotion in {"happy", "excited"}:
+        return "这一下值得庆祝！最让你开心的是哪个瞬间？" if decision.get("askQuestion") else "这件好事应该单独占一格，今天的待办清单先给它让个位。"
+    if emotion in {"sad", "wronged", "tired", "frustrated", "angry", "anxious"}:
+        return "不急着往好处想。刚才哪一件事最磨人？" if decision.get("askQuestion") else "我不急着把它变成一句‘想开点’。难受的事不必马上整理成条理清楚的解释。"
+    if intent in {"continuation", "contextual_reply"}:
+        anchor = str(mind.get("previousUserTurn") or "").strip()[:48]
+        if decision.get("askQuestion") and anchor:
+            return f"接着你刚才说的「{anchor}」，其中哪个细节最让你记住？"
+        return f"你刚才说的「{anchor}」，我更想听里面的小细节，不急着给整件事下结论。" if anchor else "我偏爱小细节，大道理反而容易把有趣的地方盖住。"
+    # Small, grounded observations for common shares; never invent an outcome or a shared past.
+    for pattern, observation, curiosity in (
+        (r"散步|走路|公园", "我偏爱散步里没有目的的那一小段，不用连走路也算成任务。", "路上有什么让你停下来多看了一眼？"),
+        (r"吃|饭|面|菜|咖啡", "我偏爱食物里能记住的小特点，比‘好吃’两个字更有画面。", "最让你记住的是哪一种味道？"),
+        (r"电影|小说|书|看剧", "我更容易记住作品里一个小场面，不一定是最热闹的高潮。", "哪个画面现在还留在你脑子里？"),
+        (r"做完|完成|解决|搞定", "做完一件事之后那点空白也很珍贵，不必立刻塞进下一项任务。", "最后卡住的那一步是怎么过去的？"),
+    ):
+        if re.search(pattern, text):
+            return observation + (curiosity if decision.get("askQuestion") else "")
+    if decision.get("askQuestion"):
+        return f"你说的「{text[:48]}」，哪一小段最值得展开？"
+    if re.search(r"开心|太棒|好消息|终于", text):
+        return "这件好事值得单独留个位置，别让接下来的待办把它挤没了。"
+    return "我更在意这件事里让你记住的小细节，急着下结论反而容易错过它。"

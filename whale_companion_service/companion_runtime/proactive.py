@@ -318,7 +318,6 @@ def apply_proactive_gates(
     interval = max(stage_policy["interval"] or 0.0, min_interval_minutes)
     checked_at = moment.isoformat()
 
-    has_due_followup = any(c["kind"] == "follow_up" for c in candidates)
 
     def veto(candidate: dict, reason: str) -> dict:
         candidate["vetoReason"] = reason
@@ -328,16 +327,19 @@ def apply_proactive_gates(
     rest = _parse_time(rest_until)
     gated: list[dict] = []
     for candidate in candidates:
+        if activity in {"meeting", "gaming", "focus"}:
+            gated.append(veto(candidate, "user_resting"))
+            continue
         # 闸门顺序即优先级，每一条都是硬规则，命中即否决并留下 vetoReason。
         # 1. 用户情境：她在跟人说话，或用户明说了在休息。
-        if activity == "active" and silence_minutes is not None and silence_minutes < ACTIVE_MIN_SILENCE_MINUTES:
+        if silence_minutes is not None and silence_minutes < ACTIVE_MIN_SILENCE_MINUTES:
             gated.append(veto(candidate, "user_still_chatting"))
             continue
         if rest is not None and moment < rest:
             gated.append(veto(candidate, "user_resting"))
             continue
         # 2. 免打扰（到期约定例外：那是用户亲口交代要提醒的）。
-        if period in _QUIET_PERIODS and not has_due_followup:
+        if period in _QUIET_PERIODS and candidate["kind"] != "follow_up":
             gated.append(veto(candidate, "quiet_hours"))
             continue
         # 3. 每日上限。

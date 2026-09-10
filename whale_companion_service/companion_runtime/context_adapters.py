@@ -211,12 +211,15 @@ def collect_context_fragments(*, user_text, conversation, memories, user_facts, 
     scene["period"] = daily_life_context(daily_state, chronotype, now=moment)["period"]
     emotion = build_emotion_state(user_text, shared, open_state)
     reaction = build_inner_reaction(shared, relationship, scene, emotion, persona)
-    decision = build_turn_decision(shared, emotion)
+    decision = build_turn_decision(shared, emotion, relationship)
     style = build_speech_style(persona, decision)
     safety = build_safety(boundaries, emotion)
     daily = daily_life_context(daily_state, chronotype, now=moment)
     # 日程推进出的状态；进模型的只有这一层处理过的投影，完整日程留在日程模块里。
     agenda_state = advance_agenda(now=moment, chronotype=chronotype, daily_state=daily_state)
+    if decision["conversationMove"] == "pivot" and daily_state and relationship.get("permissions", {}).get("allowProactiveCare"):
+        decision["replyHook"] = "self_disclosure"
+        style["replyHook"] = "self_disclosure"
     daily = {**daily, **{k: agenda_state[k] for k in
              ("currentActivity", "location", "movedFrom", "shareableEvents", "stateKind")}}
     recalled = recall_self_timeline(timeline_events or [], user_text, now=moment) if asks_about_self_timeline(user_text) else None

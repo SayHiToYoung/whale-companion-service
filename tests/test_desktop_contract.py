@@ -24,6 +24,25 @@ from pet.memory_protocol import (  # noqa: E402
 )
 
 
+def test_desktop_delivery_and_mobile_history_share_one_message(tmp_path: Path) -> None:
+    now = datetime(2026, 3, 5, 9, tzinfo=datetime.now().astimezone().tzinfo)
+    server = MemoryApiServer(MemoryRepository(tmp_path / "delivery.sqlite3", clock=lambda: now),
+                             token="contract-secret", port=0)
+    port = server.start()
+    try:
+        desktop = MemorySyncClient(f"http://127.0.0.1:{port}", "contract-secret")
+        payload = dict(user_id="u", device_id="desktop", delivery_id="one", activity="idle")
+        delivered = desktop.deliver_proactive(**payload)
+        assert delivered["assistantMessage"]["text"]
+        assert desktop.deliver_proactive(**payload) == delivered
+        page = desktop.conversation_messages(user_id="u", after_message_seq=0)
+        assert len(page["messages"]) == 1
+        assert page["messages"][0]["messageId"] == delivered["assistantMessage"]["messageId"]
+        assert not desktop.conversation_messages(user_id="u", after_message_seq=page["nextMessageSeq"])["messages"]
+    finally:
+        server.stop()
+
+
 def test_desktop_client_and_service_share_memory_v1_contract(tmp_path: Path) -> None:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     memory = {

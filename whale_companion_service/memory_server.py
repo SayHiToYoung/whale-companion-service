@@ -17,6 +17,7 @@ from .companion_mind import build_companion_mind, contextual_fallback
 from .companion_runtime.context_adapters import build_reply_frame as build_companion_frame
 from .companion_runtime.companion_emotion import empty_companion_emotion, update_companion_emotion
 from .companion_runtime.open_threads import build_open_threads
+from .companion_runtime.proactive_expression import render_proactive
 from .companion_runtime.proactive import decide_proactive_speak, evaluate_proactive_lifecycle
 from .standing_knowledge import derive_standing_knowledge, standing_knowledge_context
 from .companion_runtime.affinity import (
@@ -208,6 +209,11 @@ class MemoryRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_conversation_latest
                     ON conversation_messages(user_id, message_seq DESC);
+                CREATE TABLE IF NOT EXISTS proactive_presence (
+                    user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                    activity TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, device_id)
+                );
                 CREATE TABLE IF NOT EXISTS reply_traces (
                     user_id TEXT NOT NULL,
                     reply_message_id TEXT NOT NULL,
@@ -1655,18 +1661,19 @@ class MemoryRepository:
                 affinity_state=living["affinity"], daily_state=living["daily"],
                 chronotype=living["chronotype"], timeline_events=living["timeline"], story_provider=living["story"],
                 expression_rules=living["expressions"],
+                now=self._clock(),
             )
             fallback_kind = "grounded_memory" if is_direct_memory_question(user_text) else "contextual"
             transition, _transition_reason = lifecycle_transition_from_text(user_text)
             if is_reaction_to_companion(user_text):
-                reply_text = contextual_fallback(user_text, conversation, mind)
+                reply_text = contextual_fallback(user_text, conversation, mind, profile["companionFrame"].get("turnDecision"))
             elif (
                 not is_direct_memory_question(user_text)
                 and not is_prompt_to_speak(user_text)
                 and not transition
-                and mind["intent"] not in {"emotional_bid", "self_disclosure", "boundary"}
+                and mind["intent"] != "boundary"
             ):
-                reply_text = contextual_fallback(user_text, conversation, mind)
+                reply_text = contextual_fallback(user_text, conversation, mind, profile["companionFrame"].get("turnDecision"))
             reply_source = "fallback"
             responder = self.responder
             trace = {
@@ -2255,7 +2262,7 @@ class MemoryRepository:
         } for row in db.execute(
             """SELECT signature, kind, content, topic, status, score, window_start, best_until,
                       expires_at, deliver_count, created_at, sent_at
-               FROM proactive_candidates WHERE user_id=? ORDER BY created_at ASC LIMIT 200""",
+               FROM proactive_candidates WHERE user_id=? ORDER BY created_at ASC""",
             (user_id,),
         ).fetchall()]
 
@@ -2413,7 +2420,7 @@ class MemoryRepository:
         streak = 0
         for value in sent_times:
             spoke_at = _parse_iso(value)
-            if spoke_at is None or (replied_at is not None and replied_at > spoke_at):
+            if spoke_at is None or (replied_at is not None and replied_at >= spoke_at):
                 break
             streak += 1
         return {
@@ -2425,6 +2432,12 @@ class MemoryRepository:
     def _evaluate_proactive_locked(
         self, db: sqlite3.Connection, user_id: str, activity: str, now: datetime,
     ) -> dict:
+        quiet = db.execute(
+            "SELECT activity FROM proactive_presence WHERE user_id=? AND activity IN ('meeting','gaming','focus') AND updated_at>? LIMIT 1",
+            (user_id, (now - timedelta(minutes=20)).isoformat()),
+        ).fetchone()
+        if quiet:
+            activity = quiet["activity"]
         last_spoke = db.execute(
             """SELECT created_at FROM conversation_messages
                WHERE user_id=? AND role='assistant' ORDER BY message_seq DESC LIMIT 1""",
@@ -2538,10 +2551,29 @@ class MemoryRepository:
             ).fetchone()
             if replay is not None:
                 return json.loads(replay["response_json"])
+            device_id = str(payload.get("deviceId") or "proactive")[:128]
+            db.execute(
+                "INSERT INTO proactive_presence VALUES (?,?,?,?) ON CONFLICT(user_id,device_id) DO UPDATE SET activity=excluded.activity,updated_at=excluded.updated_at",
+                (user_id, device_id, activity, at),
+            )
             result = self._evaluate_proactive_locked(db, user_id, activity, now)
-            # 这一轮真的落定了，故事的推进才跟着写下来。
-            self._tick_story_locked(db, user_id, now)
             selected = result.get("selected") or {}
+            result["assistantMessage"] = None
+            if selected and result.get("shouldSpeak"):
+                message_id = stable_id("proactive", user_id, selected["signature"])
+                existing = db.execute("SELECT message_id,role,text,created_at FROM conversation_messages WHERE user_id=? AND message_id=?", (user_id, message_id)).fetchone()
+                if existing is not None:
+                    # Conversation history remains the durable deduplication key after queue cleanup.
+                    selected.update(decision="drop", vetoReason="already_delivered")
+                    result.update(shouldSpeak=False, selected=None, vetoReason="already_delivered", decision="drop")
+                    selected = {}
+                else:
+                    content = render_proactive(selected)
+                    db.execute("INSERT INTO conversation_messages (user_id,device_id,message_id,role,text,created_at) VALUES (?,?,?,'assistant',?,?)",
+                               (user_id, "proactive", message_id, content, at))
+                    result["assistantMessage"] = {"messageId": message_id, "role": "assistant", "text": content, "createdAt": at}
+                    result["content"] = content
+                    self._tick_story_locked(db, user_id, now)
             for candidate in result.get("candidates", []):
                 signature = str(candidate.get("signature") or "")
                 if not signature:
@@ -2572,15 +2604,9 @@ class MemoryRepository:
                      str(candidate.get("expiresAt") or ""), 1 if is_selected else 0,
                      str(candidate.get("createdAt") or at), at, at if is_selected else ""),
                 )
-            # 过期的候选清出队列。已发送的要留一阵子——它们是防重复那道锁本身——
-            # 但签名都带日期，所以留 3 天足够，不必无限增长。
+            # 已发送记录同时是故事去重和未回应压力的依据，不能三天后自动遗忘。
             db.execute(
                 "DELETE FROM proactive_candidates WHERE user_id=? AND status='expired'", (user_id,))
-            db.execute(
-                """DELETE FROM proactive_candidates
-                   WHERE user_id=? AND status='sent' AND sent_at!='' AND sent_at<?""",
-                (user_id, (now - timedelta(days=3)).isoformat()),
-            )
             result["deliveryId"] = delivery_id
             result["committedAt"] = at
             db.execute(

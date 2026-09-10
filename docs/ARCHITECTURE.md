@@ -454,7 +454,8 @@ location 和可分享事件。位置换了必须交代 `movedFrom`，否则她�
 最小间隔同时看两个口：普通回复和上一次主动开口。
 
 新增表 `proactive_candidates`（signature 主键 + 状态机 + 时间窗 + 发送时刻）。
-已发送的记录保留 3 天供防重复使用，过期候选每次落定时清出队列。
+已发送记录保留，供跨日故事去重和未回应压力计算使用；不再在 3 天后自动删除。
+过期、未发送候选每次落定时清出队列。
 
 `MemoryRepository(clock=...)` 可注入时钟，仓库内部所有时间戳都走它——
 仿真测试因此能把一整天快进一遍，而不必改系统时间。
@@ -600,6 +601,68 @@ next_eligible_at / completed_beats / available_branches`，外加 `weight` 和 `
 
 `GET /v1/companion/proactive` 只算不写，故事的推进也一样——只读的轮询不该改变故事状态。
 落库只发生在 `POST /v1/companion/proactive/deliveries` 和 `GET /v1/companion/story`。
+
+## 2026-09-09：对话推进与主动消息闭环修复
+
+### 对话策略仍走原有上下文组装器
+
+`shared_scene → turn_decision → speech_style → ContextFragment → ContextAssembler → responder`。
+没有新增记忆、日程、亲密度或故事引擎，也没有增加 LLM 决策调用。
+
+`turnDecision` 新增 `conversationMove / replyHook / hookAnchor / answerFirst / contributeContent`，
+保留兼容字段 `askQuestion / allowSilenceAfter / primaryAction`。`sharedScene` 增加最近两轮助手
+提问计数和连续低信息回复的耗尽信号。动作及停止规则见 `COMPANION-POLICIES.md`。
+提示词版本为 `big-whale-v12-conversation-moves`；本地情绪、普通分享兜底也消费该决策，
+不再由另一套无条件追问模板决定节奏。记忆问答、事实防火墙和生命周期确认仍走原路径。
+
+### 主动消息的发送定义和事务边界
+
+```text
+日程 / 记忆 / 故事候选
+  → 确定性 proactive 闸门与排序
+  → POST /v1/companion/proactive/deliveries
+  → BEGIN IMMEDIATE：重放检查 → 重新评估 → 安全规则表达
+    → 助手 conversation_messages + candidate.sent + 故事状态 + delivery 响应一起提交
+  → assistantMessage / GET conversation/messages 增量读取
+  → 手机正常回复 → 既有关系账本、用户信号与未回应压力更新
+```
+
+这里的“发送”指**消息已原子写入共享历史**，不是设备已读回执。`GET proactive` 仍只读。
+`deliveryId` 在同一用户下跨设备幂等；助手 `messageId=stable_id("proactive", userId, signature)`，
+稳定且有数据库唯一约束。串行写事务和候选终态阻止多设备同时发送同一候选。
+只有真正选中并写入消息才推进发送压力和此次投递的故事落库；defer/drop 返回 `assistantMessage: null`。
+重放返回原始响应，不重复写消息、账本或推进故事。存量旧 delivery 回执不会被追补成新消息。
+
+`proactive_expression.py` 用候选的已许可内容做确定性表达：日程带虚拟生活边界，
+故事区分共同线与虚拟生活线；情绪只回提过去，不断言用户此刻情绪。没有模型调用，
+数据库事务中没有网络等待。普通 responder 的调用仍在写事务之外。
+
+### 两端接入
+
+- 桌面 `MemorySyncClient.deliver_proactive` 使用 POST，展示返回的稳定 `assistantMessage`，
+  不把 GET 的候选当消息。沿用默认 900 秒、可配置 300–3600 秒的轮询与启动延迟。
+  同一轮以 `nextMessageSeq` 补取其他设备生成的消息；只弹最近 20 分钟的最新未见主动消息，
+  不把历史积压弹成多条气泡。安静情境下 UI 不弹气泡。
+- 桌面在 UI 线程读取 `win.context()`，再传给网络线程。服务端 `proactive_presence` 保存每设备
+  最近情境；20 分钟内的 meeting/gaming/focus 同时约束手机投递。过期快照不永久锁死用户。
+  最近用户消息也约束所有设备，不再因桌面报告 idle 而绕过“用户仍在聊天”闸门。
+- 手机移除旧 claimOpening 启动领取；可见时每 30 秒增量读取消息、最多每 60 秒检查一次投递。
+  输入中、发送中、有待发消息时不触发投递，但仍同步历史。隐藏后停轮询，恢复前台立即同步。
+  按 messageId 去重，按 nextMessageSeq 翻页；丢响应时复用本地保存的 deliveryId。
+  切换账号时丢弃旧账号在途同步响应。静态缓存版本同步更新到 v9。
+
+### 回复关联与限制
+
+沿用 30 分钟 solicited 窗口：由最近一次持久化主动发送时刻判断用户输入是否属于被主动触达后的回应，
+不是依靠客户端气泡或关键词。正向亲密度仍受 solicited 独立日上限约束；仅发送不加亲密度。
+用户有后续消息就归零未回应计数；故事按原有事实、关系和时间条件推进，普通“谢谢”不强行走一格。
+该关联是保守的时间窗口，不是语义归因；窗口内用户换话题也可能标记 solicited。
+
+尚无后台推送、设备已读确认或独立服务端定时发送器。没有客户端在线就不会主动投递。
+桌面现有聊天窗口不是这份服务端共享会话，气泡尚无进入对应共享对话的入口；本轮不重构 UI，
+继续回复须在同一 userId 的手机 PWA。桌面入口接通是明确后续项。
+情境快照在第一次轮询前、到期后或配置轮询大于 20 分钟时可能存在空窗。
+发送记录不再短期删除，后续如需归档须同时保留候选幂等键及未回应压力，不能只删队列。
 `POST /v1/companion/story/actions` 是用户选分支或拒绝某条线的唯一入口。
 
 新增表 `story_arcs`。四个模板（两个共同、两个生活）各三到四拍，刻意保持很小：

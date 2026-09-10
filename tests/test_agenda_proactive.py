@@ -437,6 +437,11 @@ def test_proactive_delivery_endpoint_commits_once_over_http(tmp_path: Path):
 
         sent = call("/v1/companion/proactive/deliveries", {"userId": "u", "deliveryId": "one"})
         assert sent["selected"] and sent["deliveryId"] == "one"
+        message = sent["assistantMessage"]
+        page = call("/v1/conversation/messages?userId=u&afterMessageSeq=0")
+        assert [row["messageId"] for row in page["messages"]] == [message["messageId"]]
+        assert page["messages"][0]["text"] == message["text"]
+        assert call(f"/v1/conversation/messages?userId=u&afterMessageSeq={page['nextMessageSeq']}")["messages"] == []
         clock["now"] = _local_start(11)
         assert call("/v1/companion/proactive/deliveries",
                     {"userId": "u", "deliveryId": "one"}) == sent

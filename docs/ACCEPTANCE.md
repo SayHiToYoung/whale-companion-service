@@ -1,4 +1,101 @@
-# 发布候选验收
+# 对话推进与主动消息闭环验收
+
+> 本次修复验收：2026-09-10。仅覆盖 whale-companion-service 和 dsh-pet-indesktop。
+> 下方旧版发布候选记录保留作历史参考，不代表本次已经完成真机体验验收。
+
+## 本次结论
+
+具备进入真实使用验证的条件，**尚不能宣称真实模型的自然度或双端真机体验已经验收**。
+测试仅使用临时数据库、注入时钟、本地 HTTP 测试服务和浏览器模拟环境；未读取或写入真实用户数据库，
+未提交、推送或部署。本次没有重新实现记忆、日程、亲密度、故事模块。
+
+## 本次命令与结果
+
+| 所在仓库 | 命令 | 结果 |
+| --- | --- | --- |
+| service | `python3 -m pytest -q` | 423 passed |
+| service | `node --test tests/mobile_sync.test.cjs` | 6 passed |
+| service | `python3 -m pytest -q -s tests/test_conversation_delivery.py` | 29 passed，包含临时数据库完整链路输出 |
+| desktop | `QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q` | 462 passed, 6 skipped |
+| 两仓库 | `git diff --check` | 通过 |
+| service | `node --check mobile/app.js` | 通过 |
+
+服务端初跑 7 项、桌面初跑 4 项因沙箱不允许监听本地端口失败，放开本地测试端口权限后通过，
+属于环境权限而非代码断言缺陷。桌面必须用仓库 .venv；本轮未安装依赖或更换解释器。
+
+## 新增验收覆盖
+
+服务端主要用例：`tests/test_conversation_delivery.py`。
+
+| 要求 | 可执行验证 |
+| --- | --- |
+| 普通分享贡献新内容，不只是回执 | 散步的个人观察 + 路上具体细节钩子；检查动作、钩子与正文 |
+| 问题优先回答 | answerFirst / answer_directly，不追加追问；无模型时坦白未知 |
+| 不想聊、别问、算了 | 三组 close/hold + none，不能换话题索要回应 |
+| 多轮不是采访 | 四轮策略 True/False/False/True；非提问轮仍贡献个人反应 |
+| 开心、低落 | 亲近关系接梗庆祝；低落一次轻问题后不连续盘问 |
+| 短回复、话题耗尽 | 保留上一轮具体话题；明确换题或连续低信息回复时可 pivot |
+| 关系权限 | 疏离/受限不深入，亲近允许 memory_callback；事实依据仍由原组装器限制 |
+| 只读评估 | 多次 GET 评估不新增候选、故事、历史或 delivery 记录 |
+| 落定、重试、并发 | POST 创建稳定助手消息；相同 ID 重放一致；两设备竞争只写一次 |
+| 手机增量读取 | messageSeq 游标取得主动消息，之后为空；HTTP 与跨仓库客户端也验证 |
+| 回复与压力 | 回复后 noResponseStreak=0，关系账本 solicited=true；连续未回应跨 4 天仍保留压力 |
+| 免打扰、话题屏蔽 | 桌面 meeting/gaming/focus 同时约束手机；已屏蔽候选不进入消息；未发送不记压力 |
+| 日程与故事 | 真实候选进入历史；故事消息重放不改变 arc，36 步时间模拟无重复故事签名 |
+| 模型不可用 | 对话兜底仍遵守多轮节奏；主动表达完全确定性，无额外模型调用 |
+
+`tests/mobile_sync.test.cjs` 执行真实 app.js 同步与渲染函数：POST/GET 双路径去重、隐藏暂停/前台恢复、
+丢失响应后复用 deliveryId、输入/发送期间只读同步、游标分页、切换账号后丢弃旧响应。
+这不是 Safari/Chrome 真机测试，也没有模拟整个浏览器布局。
+
+桌面 `tests/test_memory_client.py` 新增 POST 契约、失败重试稳定 ID、只展示 assistantMessage、
+其他设备消息的增量恢复、去重和安静状态测试。
+`test_desktop_contract.py` 用真实本地 HTTP 验证桌面客户端与服务端消息一致。
+
+## 临时数据库运行记录
+
+完整用例 `test_runtime_share_agenda_delivery_mobile_reply_and_solicited_cap`：
+
+1. 用户分享公园散步；规则回复包含具体观察及“路上有什么让你停下来多看了一眼”的钩子。
+2. 时钟推进两小时，日程候选通过闸门，经 delivery 原子写入助手历史。
+3. 通过上一轮 nextMessageSeq 取得该主动消息；未回应计数为 1。
+4. 一分钟后手机回复“谢谢你”；未回应计数变为 0，关系账本记录 solicited，正向事件不超过原额度。
+5. 故事状态已经落库；单独故事仿真验证重放不推进第二次。回复不是强制故事跳步的条件。
+
+运行输出包含 `flow=share→hook→agenda→delivery→mobile-cursor→reply`、稳定 messageId、
+`noResponseStreak=0`、`solicited=true`。没有用真实账号或真实数据库做写入实验。
+
+## 修改文件清单
+
+服务端仓库：
+
+- `whale_companion_service/companion_runtime/{shared_scene,turn_decision,speech_style,context_adapters}.py`
+- `whale_companion_service/companion_runtime/{proactive,proactive_expression}.py`（后者新增）
+- `whale_companion_service/{companion_mind,companion_llm,memory_server}.py`
+- `mobile/{app.js,index.html,sw.js}`
+- `tests/{test_conversation_delivery.py,mobile_sync.test.cjs}`（新增）
+- `tests/{test_agenda_proactive,test_desktop_contract}.py`
+- `docs/{ARCHITECTURE,COMPANION-POLICIES,ACCEPTANCE}.md`
+
+桌面仓库：`pet/connectors/memory_service.py`、`pet/memory_protocol.py`、`pet/app.py`、`tests/test_memory_client.py`。
+
+## 仍需真实体验验证的边界
+
+- 桌面气泡仍为短时展示，没有通向该共享会话的入口；已有桌面聊天是另一条本地聊天链路。
+  本轮不扩大 UI 重构，继续回复需使用相同 userId 的手机 PWA；桌面共享聊天入口是后续项。
+- 手机只在可见时轮询，无后台推送；桌面默认每 15 分钟投递/补取一次。没有客户端在线时不触发主动发送。
+- “发送”表示持久化可读取，不是用户已读；未回应压力不是已读不回判断。
+- 30 分钟内回复按时间标记 solicited，不做语义归因；窗口内另起话题也可能计入。
+- 跨设备安静情境为 20 分钟有效的快照，不是实时存在状态；首次上报前、过期后存在感知空窗。
+- 规则兜底有限，复杂问答会坦白无法回答；自动测试证明策略、内容样例和状态闭环，不证明真实模型每次表达自然。
+- 已发送记录需保留幂等与压力依据；后续数据归档不能直接删除这部分状态。
+
+下一步可在测试账号上配置实际模型，开启同一账号的桌面和手机，人工验证连续 10–20 轮自然度、
+跨端消息可见性、免打扰和前后台恢复。本次没有擅自执行这些真实账号操作。
+
+---
+
+# 历史记录：上一阶段发布候选验收
 
 > 验收日期：2026-09-09 · 范围：`whale-companion-service` 本轮统一上下文与主动生命周期改动，
 > 连同 `dsh-pet-indesktop`、`dsh-agent-office` 的回归。

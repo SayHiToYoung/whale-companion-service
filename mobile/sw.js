@@ -1,11 +1,11 @@
 "use strict";
 
 // 缓存版本与 app.js / styles.css 的 ?v= 保持一致，发新版时同步修改
-const CACHE = "whale-mobile-shell-v8";
+const CACHE = "whale-mobile-shell-v9";
 const SHELL = [
   "/",
   "/styles.css?v=4",
-  "/app.js?v=8",
+  "/app.js?v=9",
   "/manifest.webmanifest",
   "/media/whale-v2.jpg",
   "/media/ojingjing.jpg",

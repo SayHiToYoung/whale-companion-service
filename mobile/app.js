@@ -32,6 +32,13 @@ const state = {
   messageIds: new Set(),
   statusTimer: null,
   modelEnabled: false,
+  nextMessageSeq: 0,
+  syncTimer: null,
+  syncing: false,
+  sending: false,
+  ready: false,
+  lastDeliveryCheck: 0,
+  lastInputAt: 0,
 };
 
 function randomId(prefix) {
@@ -179,10 +186,59 @@ function renderPendingOutbox() {
 }
 
 async function loadHistory() {
-  const query = new URLSearchParams({userId: state.settings.userId, afterMessageSeq: "0", limit: "300"});
-  const result = await api(`/v1/conversation/messages?${query}`);
-  for (const message of result.messages || []) renderMessage(message);
+  const settings = state.settings;
+  let more = true;
+  while (more) {
+    const query = new URLSearchParams({userId: state.settings.userId,
+      afterMessageSeq: String(state.nextMessageSeq), limit: "300"});
+    const result = await api(`/v1/conversation/messages?${query}`);
+    if (state.settings !== settings) return;
+    for (const message of result.messages || []) renderMessage(message);
+    const next = Number(result.nextMessageSeq);
+    more = Boolean(result.hasMore) && next > state.nextMessageSeq;
+    state.nextMessageSeq = Math.max(state.nextMessageSeq, next || 0);
+  }
 }
+
+function scheduleSync() {
+  clearTimeout(state.syncTimer);
+  if (!document.hidden && state.ready) state.syncTimer = setTimeout(syncConversation, 30000);
+}
+
+async function syncConversation() {
+  if (document.hidden || !state.ready || state.syncing) return;
+  state.syncing = true;
+  const settings = state.settings;
+  try {
+    await loadHistory();
+    if (!state.ready || state.settings !== settings) return;
+    const typing = elements.input.value.trim() || Date.now() - state.lastInputAt < 30000;
+    if (!document.hidden && !state.sending && !typing && !outbox().length && Date.now() - state.lastDeliveryCheck >= 60000) {
+      const key = `${STORAGE_KEY}:delivery:${state.settings.url}:${state.settings.userId}:${state.settings.deviceId}`;
+      const deliveryId = localStorage.getItem(key) || randomId("delivery");
+      localStorage.setItem(key, deliveryId);
+      const result = await api("/v1/companion/proactive/deliveries", {
+        method: "POST", body: JSON.stringify({userId: state.settings.userId,
+          deviceId: state.settings.deviceId, deliveryId, activity: "active"}),
+      });
+      if (state.settings !== settings) return;
+      localStorage.removeItem(key);
+      state.lastDeliveryCheck = Date.now();
+      if (result.assistantMessage) renderMessage(result.assistantMessage);
+      await loadHistory();
+    }
+  } catch (_) {
+    // Cursor and pending delivery ID survive failures; the next visible poll recovers.
+  } finally {
+    state.syncing = false;
+    scheduleSync();
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(state.syncTimer);
+  if (!document.hidden) void syncConversation();
+});
 
 async function loadCompanionStatus() {
   const result = await api("/health");
@@ -199,44 +255,8 @@ async function loadCompanionStatus() {
   }
 }
 
-async function claimOpening() {
-  // 每次启动都用新的 claimId，避免失败后重复消费上次的旧响应
-  // （服务端对重复 claimId 会返回 duplicateClaim 的旧结果）
-  const claimId = randomId("claim");
-  try {
-    const result = await api("/v1/companion/openings/claim", {
-      method: "POST",
-      body: JSON.stringify({
-        userId: state.settings.userId,
-        deviceId: state.settings.deviceId,
-        claimId,
-      }),
-    });
-    if (result.shouldSend) {
-      renderMessage({
-        messageId: result.messageId,
-        role: "assistant",
-        text: result.text,
-        createdAt: new Date().toISOString(),
-      });
-      showReceipt(result.latestMemory);
-      setHandoff("小鲸的最新报信已经送到");
-    } else if (result.reason === "awaiting_user_reply") {
-      if (result.pendingAssistant) {
-        renderMessage({...result.pendingAssistant, role: "assistant"});
-      }
-      setHandoff("大鲸在等你回复，不会重复打扰");
-    } else {
-      setHandoff("小鲸的报信已读，目前没有新内容");
-    }
-  } catch (error) {
-    // claim 失败（断网/服务异常）时不阻塞整体启动，只提示连接状态
-    setHandoff("暂时没有连上共享记忆", "error");
-    throw error;
-  }
-}
-
 async function sendMessage(item, article = null) {
+  state.sending = true;
   try {
     showStatus(
       state.modelEnabled ? "大鲸正在想怎么回应你。" : "大鲸正在整理记忆里的线索。",
@@ -293,6 +313,8 @@ async function sendMessage(item, article = null) {
     }
     showStatus(`暂时没送出去，联网后会再试。${error.message}`, "error", 6000);
     return false;
+  } finally {
+    state.sending = false;
   }
 }
 
@@ -326,7 +348,6 @@ async function boot() {
     renderPendingOutbox();
     await flushOutbox();
     if (historyError) throw historyError;
-    await claimOpening();
     setHandoff(elements.handoffText.textContent, "connected");
     elements.empty.hidden = state.messageIds.size > 0;
   } catch (error) {
@@ -335,6 +356,8 @@ async function boot() {
     elements.empty.hidden = state.messageIds.size > 0;
   } finally {
     elements.loading.hidden = true;
+    state.ready = true;
+    void syncConversation();
   }
 }
 
@@ -358,6 +381,7 @@ elements.composer.addEventListener("submit", async (event) => {
 });
 
 elements.input.addEventListener("input", () => {
+  state.lastInputAt = Date.now();
   elements.input.style.height = "auto";
   const maxHeight = parseFloat(getComputedStyle(elements.input).maxHeight) || 132;
   elements.input.style.height = `${Math.min(elements.input.scrollHeight, maxHeight)}px`;
@@ -378,10 +402,11 @@ elements.openSettings.addEventListener("click", () => {
 
 elements.saveSettings.addEventListener("click", async () => {
   if (!elements.serviceUrl.reportValidity() || !elements.token.reportValidity() || !elements.userId.reportValidity()) return;
-  state.settings.url = elements.serviceUrl.value.trim().replace(/\/$/, "");
-  state.settings.token = elements.token.value;
-  state.settings.userId = elements.userId.value.trim();
-  saveSettings();
+  const previousSettings = state.settings;
+  state.ready = false;
+  clearTimeout(state.syncTimer);
+  state.settings = {...previousSettings, url: elements.serviceUrl.value.trim().replace(/\/$/, ""),
+    token: elements.token.value, userId: elements.userId.value.trim()};
   elements.saveSettings.disabled = true;
   try {
     await api("/v1/conversation/messages?" + new URLSearchParams({
@@ -389,9 +414,13 @@ elements.saveSettings.addEventListener("click", async () => {
       afterMessageSeq: "0",
       limit: "1",
     }));
+    saveSettings();
     elements.dialog.close();
     location.reload();
   } catch (error) {
+    state.settings = previousSettings;
+    state.ready = true;
+    scheduleSync();
     elements.settingsError.textContent = error.message;
     elements.settingsError.hidden = false;
   } finally {
