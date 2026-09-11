@@ -22,9 +22,15 @@ def explicit_emotion_label(text: str) -> str:
     if not value:
         return ""
     first_person = any(token in value for token in ("我", "本人", "自己"))
+    # Chinese commonly omits the first-person subject in a current-state sentence:
+    # "今天真的好烦" is still an explicit self-report in a direct chat.  Keep the
+    # accepted lead-in deliberately small so a sentence such as "他今天好烦" is not
+    # accidentally attributed to the user.
     direct_feeling = bool(
         re.search(
-            r"(?:^|[，。！？\s])(?:好|很|太|真|有点|特别)"
+            r"(?:^|[，。！？\s])"
+            r"(?:(?:今天|现在|刚才|这会儿)(?:真的|确实|简直)?|(?:真的|确实|简直))?"
+            r"(?:好|很|太|真|有点|特别)"
             r"(?:烦|累|开心|难过|焦虑|生气|委屈)",
             value,
         )

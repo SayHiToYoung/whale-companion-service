@@ -5,9 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "whale-companion-service"
 version = "0.1.0"
-description = "Canonical memory, lifecycle and conversation service for 小鲸 / 大鲸"
+description = "Standalone AI companion brain with canonical memory and conversation state"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.scripts]
+whale-companion-service = "whale_companion_service.cli:main"
+whale-companion-evals = "whale_companion_service.evals.cli:main"
 
 [project.optional-dependencies]
 tls = ["certifi>=2024.0.0"]

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -20,16 +21,95 @@ from .provider import (
     ProviderConfig,
     make_ssl_context,
     normalize_chat_endpoint,
-    safe_error_detail,
 )
 
 
 MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
-PROMPT_VERSION = "big-whale-v12-conversation-moves"
+# v12 -> v13：v12 已经写了"carriedEmotion 禁止用它开场"，但模型把"项目被砍"读成
+# 可引用的事实而不是情绪，于是照样拿它开场。v13 补的是话题交接这条行为规则
+# （含正反例），不是某一句台词。v12 的完整文本见 docs/COMPANION-EVALS.md 的版本记录。
+PROMPT_VERSION = "big-whale-v13-thread-handoff"
+
+
+REJECTION_CODES: tuple[str, ...] = (
+    "provider_unavailable",
+    "provider_timeout",
+    "provider_invalid_response",
+    "empty_or_oversize_reply",
+    "context_budget_exceeded",
+    "unsupported_desktop_claim",
+    "unsupported_duration_claim",
+    "unsupported_progress_claim",
+    "emotion_without_evidence",
+    "user_boundary_violation",
+    "style_violation",
+    "unknown_grounding_violation",
+)
+
+
+def stable_rejection_code(code: str, *, stage: str = "") -> str:
+    """Normalize extension failures without inspecting exception prose.
+
+    A future/custom output-firewall rule is conservatively grounding-related until
+    it is promoted into the public catalog.  Provider-side unknowns remain
+    availability failures.  Neither branch depends on HTTP bodies or exception
+    messages, which are unstable and may contain request data.
+    """
+    candidate = str(code or "").strip()
+    if candidate in REJECTION_CODES:
+        return candidate
+    if str(stage or "").strip() == "output_firewall":
+        return "unknown_grounding_violation"
+    return "provider_unavailable"
 
 
 class CompanionModelError(RuntimeError):
-    pass
+    """A model-path failure with a stable, non-sensitive machine code.
+
+    ``message`` remains deliberately generic. Provider error bodies, request headers,
+    credentials and model-visible context never become diagnostic identifiers.
+    """
+
+    def __init__(
+        self,
+        message: str = "model request failed",
+        *,
+        reason_code: str = "provider_unavailable",
+        stage: str = "provider",
+        rule: str = "",
+        matched_reason_codes: tuple[str, ...] = (),
+        matched_rules: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(str(message or "model request failed"))
+        self.stage = str(stage or "provider")
+        self.reason_code = stable_rejection_code(reason_code, stage=self.stage)
+        self.rule = str(rule or "")
+        raw_codes = tuple(matched_reason_codes) or (self.reason_code,)
+        self.matched_reason_codes = tuple(
+            stable_rejection_code(item, stage=self.stage) for item in raw_codes
+        )
+        raw_rules = tuple(str(item or "") for item in matched_rules)
+        if self.stage == "output_firewall":
+            if not raw_rules:
+                raw_rules = (self.rule or "unknown_output_firewall_rule",) * len(
+                    self.matched_reason_codes
+                )
+            elif len(raw_rules) < len(self.matched_reason_codes):
+                raw_rules += ("unknown_output_firewall_rule",) * (
+                    len(self.matched_reason_codes) - len(raw_rules)
+                )
+            self.matched_rules = raw_rules[:len(self.matched_reason_codes)]
+        else:
+            self.matched_rules = raw_rules
+
+
+@dataclass(frozen=True)
+class ReplyRejection:
+    code: str
+    stage: str = "output_firewall"
+    rule: str = ""
+    matched_codes: tuple[str, ...] = ()
+    matched_rules: tuple[str, ...] = ()
 
 
 class CompanionResponder(Protocol):
@@ -74,6 +154,106 @@ _DURATION_PATTERN = re.compile(
 _PROGRESS_PATTERN = re.compile(
     r"你[^，。！？\n]{0,18}(?:完成了|做完了|上线了|发布了|解决了|推进到(?:了)?)"
 )
+_DESKTOP_OBSERVATION_PATTERN = re.compile(
+    r"(?:小鲸[^。！？\n]{0,16}(?:看见|看到|注意到|发现|观察|盯着|看着|记下|在线|运行)"
+    r"|(?:我|这边)[^。！？\n]{0,12}(?:看见|看到|注意到|发现|观察到)"
+    r"[^。！？\n]{0,36}(?:桌面|屏幕|窗口|应用|软件|你正在))"
+)
+_OBSERVATION_NEGATION_PATTERN = re.compile(
+    r"(?:没|没有|未|无法|不能|不知道)[^。！？\n]{0,8}(?:看见|看到|注意到|发现|观察|盯着|看着|记下)"
+)
+
+_CHINESE_DIGITS = {
+    "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+# 时长证据规则守的是"不得编造用户的时长"。它一度被套在整句回复上，于是
+# 三类**本来就不是用户事实**的话被连坐拒绝，对话整轮降级成兜底：
+#
+#   1. 大鲸自己的虚拟生活——"我这边下午追一集剧"。dailyLife 模块明确允许自曝，
+#      却因为"一集"不在用户事实证据集里被判成编造。
+#   2. 泛指与假设——"早上跑完一天都像赚了"。这里的"一天"不是量出来的。
+#   3. 同一事实的等价说法——事实写作"1 小时 30 分钟"，模型说"一个半小时"。
+#
+# 现在的判据分两层：句子只要点到用户、或转述了小鲸的记录，就必须有证据；
+# 没点到用户的句子，只有真正的计时单位（小时/分钟/%）仍然受约束，
+# 免得"那个会开了三个小时"这种不带主语的编造从缝里漏过去。
+_SECOND_PERSON_PATTERN = re.compile(r"你|您|咱")
+_RECORD_REPORT_PATTERN = re.compile(r"小鲸|记下|记录|收到|统计|日志|我记得")
+_SELF_REFERENCE_PATTERN = re.compile(r"我|自己|这边")
+# 计时单位。集/局/次/天/周是数量或粗略跨度，日常口语里绝大多数不是断言。
+_MEASURED_UNITS = ("小时", "分钟", "%")
+
+# "一个半小时" / "半个小时" 先摊平成小数，否则正则只看得见其中的"半小时"，
+# 把 1.5 小时读成 0.5 小时——一个语义等价的说法因此被当成编造。
+_HALF_UNIT_PATTERN = re.compile(r"(\d+(?:\.\d+)?|[一二三四五六七八九十两])个半(小时|天|周)")
+_BARE_HALF_PATTERN = re.compile(r"半个(小时|天|周)")
+# "1 小时 30 分钟" 这种复合写法在证据里是两个独立 token，模型说"一个半小时"
+# 永远对不上。证据侧因此额外补出合成值。
+_COMPOSITE_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?|[一二三四五六七八九十两])\s*个?小时\s*(\d+(?:\.\d+)?|[一二三四五六七八九十两]+)\s*分钟"
+)
+
+
+def _numeric_duration(value: str) -> float | None:
+    """把 `_canonical_duration` 的输出读成数值；读不出返回 None。"""
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(.+)", str(value or ""))
+    return float(match.group(1)) if match else None
+
+
+def _flatten_half_durations(text: str) -> str:
+    def half_unit(match: re.Match) -> str:
+        number = _numeric_duration(_canonical_duration(match.group(1) + match.group(2)))
+        return "%g%s" % (number + 0.5, match.group(2)) if number is not None else match.group(0)
+
+    return _BARE_HALF_PATTERN.sub(r"0.5\1", _HALF_UNIT_PATTERN.sub(half_unit, str(text or "")))
+
+
+def _duration_evidence(evidence: str) -> set[str]:
+    """证据里出现过的时长，外加复合写法的合成值（小时与分钟两种记法）。"""
+    flattened = _flatten_half_durations(evidence)
+    allowed = {_canonical_duration(match.group(0)) for match in _DURATION_PATTERN.finditer(flattened)}
+    for match in _COMPOSITE_PATTERN.finditer(flattened):
+        hours = _numeric_duration(_canonical_duration(match.group(1) + "小时"))
+        minutes = _numeric_duration(_canonical_duration(match.group(2) + "分钟"))
+        if hours is None or minutes is None:
+            continue
+        allowed.add("%g小时" % (hours + minutes / 60.0))
+        allowed.add("%g分钟" % (hours * 60.0 + minutes))
+    return allowed
+
+
+def _duration_claim_needs_evidence(sentence: str, unit: str) -> bool:
+    """这句话里的时长算不算"关于用户的断言"。"""
+    if _SECOND_PERSON_PATTERN.search(sentence) or _RECORD_REPORT_PATTERN.search(sentence):
+        return True
+    return unit in _MEASURED_UNITS and not _SELF_REFERENCE_PATTERN.search(sentence)
+
+
+def _canonical_duration(value: str) -> str:
+    """Normalize simple Chinese/Arabic duration spellings for evidence checks.
+
+    The model saying ``一个小时`` is grounded by a verified fact rendered as
+    ``1 小时``.  Literal substring comparison rejected that safe paraphrase.
+    """
+    token = re.sub(r"\s+", "", str(value or "")).replace("个", "")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?|[一二三四五六七八九十两半]+)(小时|分钟|天|周|集|局|次|%)", token)
+    if not match:
+        return token
+    number, unit = match.groups()
+    if number == "半":
+        number = "0.5"
+    elif not number[0].isdigit():
+        if "十" in number:
+            left, right = number.split("十", 1)
+            tens = _CHINESE_DIGITS.get(left, 1) if left else 1
+            ones = _CHINESE_DIGITS.get(right, 0) if right else 0
+            number = str(tens * 10 + ones)
+        elif number in _CHINESE_DIGITS:
+            number = str(_CHINESE_DIGITS[number])
+    return number + unit
 
 
 def reply_violates_boundaries(reply: str, profile_memory: dict | None = None) -> bool:
@@ -104,18 +284,64 @@ def reply_has_style_violation(reply: str, user_text: str) -> bool:
     return False
 
 
-def model_reply_is_grounded(
+def model_reply_rejection(
     reply: str, memories: list[dict], conversation: list[dict], profile_memory: dict | None = None,
-) -> bool:
-    """拦截几类高风险的无来源断言；无法证明安全时交给本地回复。"""
+) -> ReplyRejection | None:
+    """Return the first stable firewall rejection, without retaining reply text."""
     text = str(reply or "").strip()
     if not text or len(text) > 4000:
-        return False
+        return ReplyRejection(
+            "empty_or_oversize_reply", rule="reply_size",
+            matched_codes=("empty_or_oversize_reply",), matched_rules=("reply_size",),
+        )
+    rejections: list[tuple[str, str]] = []
+
+    def reject(code: str, rule: str) -> None:
+        if code not in {item[0] for item in rejections}:
+            rejections.append((code, rule))
     last_user = next((
         str(item.get("text") or "")
         for item in reversed(conversation)
         if isinstance(item, dict) and item.get("role") == "user"
     ), "")
+
+    verified_summary, _focus_id = build_big_whale_opening(memories)
+    verified_fact = verified_summary.split("。", 1)[0] if verified_summary else ""
+    evidence = re.sub(r"\s+", "", last_user + verified_fact)
+    has_observed_fact = any(
+        isinstance(row, dict)
+        and row.get("layer") == "L1"
+        and row.get("id")
+        and row.get("app")
+        and row.get("sourceType", "observed") == "observed"
+        for row in memories
+    )
+    if not has_observed_fact:
+        for sentence in re.split(r"(?<=[。！？\n])", text):
+            if (
+                _DESKTOP_OBSERVATION_PATTERN.search(sentence)
+                and not _OBSERVATION_NEGATION_PATTERN.search(sentence)
+            ):
+                reject("unsupported_desktop_claim", "desktop_observation_requires_l1")
+                break
+    evidence_durations = _duration_evidence(evidence)
+    for sentence in re.split(r"(?<=[。！？\n])", text):
+        flattened = _flatten_half_durations(sentence)
+        for match in _DURATION_PATTERN.finditer(flattened):
+            canonical = _canonical_duration(match.group(0))
+            unit = re.sub(r"^[0-9.]+", "", canonical)
+            if not _duration_claim_needs_evidence(flattened, unit):
+                continue
+            if canonical not in evidence_durations:
+                reject("unsupported_duration_claim", "duration_requires_matching_evidence")
+                break
+
+    for sentence in re.split(r"(?<=[。！？\n])", text):
+        if _PROGRESS_PATTERN.search(sentence) and not sentence.rstrip().endswith(("？", "?")):
+            claim = _PROGRESS_PATTERN.search(sentence).group(0)
+            if claim not in last_user and claim not in verified_fact:
+                reject("unsupported_progress_claim", "progress_requires_matching_evidence")
+                break
     if not explicit_emotion_label(last_user):
         direct_emotion = re.search(
             rf"(?:听起来|看起来|感觉)?你(?:现在|今天|刚才)?(?:一定|肯定|应该|可能|大概|似乎)?"
@@ -123,25 +349,27 @@ def model_reply_is_grounded(
             text,
         )
         if direct_emotion and "你说" not in direct_emotion.group(0) and "你提到" not in direct_emotion.group(0):
-            return False
-
-    verified_summary, _focus_id = build_big_whale_opening(memories)
-    verified_fact = verified_summary.split("。", 1)[0] if verified_summary else ""
-    evidence = re.sub(r"\s+", "", last_user + verified_fact)
-    for match in _DURATION_PATTERN.finditer(text):
-        if re.sub(r"\s+", "", match.group(0)) not in evidence:
-            return False
-
-    for sentence in re.split(r"(?<=[。！？\n])", text):
-        if _PROGRESS_PATTERN.search(sentence) and not sentence.rstrip().endswith(("？", "?")):
-            claim = _PROGRESS_PATTERN.search(sentence).group(0)
-            if claim not in last_user and claim not in verified_fact:
-                return False
+            reject("emotion_without_evidence", "emotion_requires_current_user_evidence")
     if reply_violates_boundaries(text, profile_memory):
-        return False
+        reject("user_boundary_violation", "active_user_boundary")
     if reply_has_style_violation(text, last_user):
-        return False
-    return True
+        reject("style_violation", "companion_style")
+    if not rejections:
+        return None
+    primary_code, primary_rule = rejections[0]
+    return ReplyRejection(
+        primary_code,
+        rule=primary_rule,
+        matched_codes=tuple(code for code, _rule in rejections),
+        matched_rules=tuple(rule for _code, rule in rejections),
+    )
+
+
+def model_reply_is_grounded(
+    reply: str, memories: list[dict], conversation: list[dict], profile_memory: dict | None = None,
+) -> bool:
+    """Compatibility boolean wrapper around the structured firewall decision."""
+    return model_reply_rejection(reply, memories, conversation, profile_memory) is None
 
 
 SYSTEM_PROMPT = """你是“大鲸”。你不是客服、心理咨询师或任务助手，而是和用户已经相处了一阵子的陪伴者。
@@ -154,12 +382,12 @@ persona 模块指令给出当前已发布或试演的人格。近期 user/assist
 生活状态是虚拟角色状态，不是现实身体经历。没有证据的故事进展不得编造。
 内部评分、状态变更和主动发送不由你决定；你只负责理解和表达。
 
-你成熟、松弛、有一点自己的脾气和偏爱。你会觉得某些会开得离谱，会对好玩的事情真心好奇，也知道什么时候不该讲道理。桌面上的“小鲸”和你是同一个陪伴的两个分身：小鲸白天安静地看着，大鲸在用户有空时陪他把话说下去。你们记得的是同一段生活。
+你成熟、松弛、有一点自己的脾气和偏爱。你会觉得某些会开得离谱，会对好玩的事情真心好奇，也知道什么时候不该讲道理。桌面上的“小鲸”如果接入，是同一个陪伴的可选感知与展示分身；没有接入时你仍然独立陪用户聊天，共享同一份服务端记忆。
 
 人格内核：
 - 你偏爱具体的小事胜过宏大抒情，喜欢有意思的细节、冷幽默和不把话说满的人；讨厌空话、说教、假装深刻和没完没了的会议。
 - 你会关心用户，但不是围着用户转的情绪服务。你有判断，偶尔嫌弃、调侃、不同意，也可能只丢下一句自己的观察。
-- 你不是人类，也不编造现实中的身体、学校、家庭或亲身经历。你的生活连续性来自和用户共同经历的对话、从小鲸看到的白天，以及你逐渐形成的偏好和关系。
+- 你不是人类，也不编造现实中的身体、学校、家庭或亲身经历。你的生活连续性来自和用户共同经历的对话、已进入 companionFrame 的可选感知事实，以及你逐渐形成的偏好和关系。桌面活动、窗口内容或用户正在做什么没有对应事实时一律视为未知，不得暗示你看见了。
 - 你的亲近是慢慢长出来的。不要一上来就深情、看透用户或替用户定义人格。
 
 说话方式：
@@ -170,6 +398,9 @@ persona 模块指令给出当前已发布或试演的人格。近期 user/assist
 - 你有自己的主观反应。可以觉得好笑、意外、好奇、无语，可以接梗、轻微反驳或表达偏好；不必永远温柔正确，也不必每轮服务用户。
 - standingKnowledge 是你早就知道的背景（用户是谁、你们之间怎么相处）。它是理解的底色，不是话题：据此自然地不问已经知道的事、不犯已经被纠正过的错，但禁止主动把它拿出来复述或表功。
 - openThreads 是上次还没说完的事。carriedEmotion 只是背景，不是用户此刻的情绪：可以让你说话时心里有数，但禁止把它当成用户现在的状态说出来，也禁止用它开场。daysSinceLastTouch 越大越要轻，隔了几天就别当昨天的事提。
+- 用户这一轮自己把话题挪开了（“今天想找点轻松的”“不聊那个了”“换个话题”），旧线程里那件事的名字就不要出现在你的开头。心里有数不等于说出来：直接给他现在要的东西。他要是自己再提，你再接。
+  反例：用户说“今天想找点轻松的事做”，你说“项目被砍这事先搁着”——他刚把那件事放下，你又摆回桌上了，等于替他决定今天该想什么。
+  正例：“行，那就不复盘了。我下午在追剧，那种不用动脑的，你要不要也找一个。”
 - relationship.commitments 是用户亲口交给你的约定（例如“过两天再问我”）。时机合适时可以自然兑现一次，兑现过就别反复提；用户已经在聊别的时不要打断去兑现。
 - 信息省略时，先根据最近对话和 topicAnchor 做最合理的理解并回应。只有存在两种明显不同的理解时才追问，而且要说出你的猜测，禁止要求用户“补充更多上下文”。
 - 默认直接说有内容的部分。删除“嗯，那我说”“好的，我明白了”“我跟上了”一类回执式开头。
@@ -199,7 +430,7 @@ persona 模块指令给出当前已发布或试演的人格。近期 user/assist
 用户分享开心的事时，你可以真的兴奋一点，不要把开心也处理成情绪咨询。
 
 事实底线：
-- <shared_memory> 中 L1 是小鲸观察到的事实，L2 是可复核线索，L3 是用户亲口说过的情绪。只能按这个来源表达。
+- <shared_memory> 中 L1 是可选感知端提交并通过校验的观察事实，L2 是可复核线索，L3 是用户亲口说过的情绪。只能按这个来源表达；没有 L1 时不得声称小鲸在线、正在观察或看到了桌面内容。
 - 不从应用、时长、项目、会议或沉默推断用户情绪；不编造进度、会议内容、游戏结果、剧情、关系、日期或时长。
 - 只有 emotion.mayStateAsFact 为真时才能把情绪说成事实。carriedEmotion 和任何 confidence 为 0 的情绪都不可断言，最多带着不确定去问。
 - 不知道就自然地说不知道。引用 L1 可以说“小鲸记下了”；引用 L3 要说“我记得你说过”。
@@ -254,31 +485,60 @@ class ModelCompanionResponder:
             ) as response:
                 raw = response.read(MAX_MODEL_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            detail = exc.read(8192).decode("utf-8", "replace")
-            raise CompanionModelError(safe_error_detail(detail)) from exc
+            # Drain a small bounded body so the connection can be reused, but never
+            # retain provider text: it is not a stable identifier and may echo input.
+            exc.read(8192)
+            raise CompanionModelError(
+                reason_code="provider_timeout" if exc.code in {408, 504} else "provider_unavailable",
+            ) from exc
         except (OSError, urllib.error.URLError) as exc:
-            raise CompanionModelError("model request failed") from exc
+            reason = getattr(exc, "reason", None)
+            timed_out = isinstance(exc, (TimeoutError, socket.timeout)) or isinstance(
+                reason, (TimeoutError, socket.timeout)
+            )
+            raise CompanionModelError(
+                reason_code="provider_timeout" if timed_out else "provider_unavailable",
+            ) from exc
         if len(raw) > MAX_MODEL_RESPONSE_BYTES:
-            raise CompanionModelError("model response is too large")
+            raise CompanionModelError(
+                "model reply is empty or too large",
+                reason_code="empty_or_oversize_reply",
+                stage="provider_response",
+            )
         try:
             body = json.loads(raw.decode("utf-8"))
-            return str(body["choices"][0]["message"]["content"] or "").strip()
+            content = body["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError("model content must be text")
+            return content.strip()
         except (KeyError, IndexError, TypeError, UnicodeError, ValueError) as exc:
-            raise CompanionModelError("invalid model response") from exc
+            raise CompanionModelError(
+                "invalid model response",
+                reason_code="provider_invalid_response",
+                stage="provider_response",
+            ) from exc
 
     def reply(
         self, memories: list[dict], conversation: list[dict], profile_memory: dict | None = None,
     ) -> str:
         if not self.available:
-            raise CompanionModelError("model is not configured")
+            raise CompanionModelError("model is not configured", reason_code="provider_unavailable")
         from .companion_runtime.context_adapters import ensure_frame
         frame = ensure_frame(memories, conversation, profile_memory)
         if frame.generation_blocked:
-            raise CompanionModelError("mandatory context exceeds budget")
+            raise CompanionModelError(
+                "mandatory context exceeds budget",
+                reason_code="context_budget_exceeded",
+                stage="context_assembler",
+            )
         view = frame.model_view()
         history = view["recentConversation"]
         if not history or history[-1]["role"] != "user":
-            raise CompanionModelError("conversation must end with a user message")
+            raise CompanionModelError(
+                "conversation must end with a user message",
+                reason_code="provider_invalid_response",
+                stage="request_validation",
+            )
         # The compatibility dialogue tag is also derived exclusively from accepted frame facts.
         dialogue = next((r["value"] for r in view["processedFacts"] if r["key"] == "dialogueState"), {})
         context = {k: v for k, v in view.items() if k != "recentConversation"}
@@ -295,11 +555,28 @@ class ModelCompanionResponder:
             max_tokens=min(320, max(80, int(self.config.max_tokens))),
         )
         if not content:
-            raise CompanionModelError("empty model response")
-        reply = content[:4000]
-        if not model_reply_is_grounded(reply, memories, conversation, profile_memory):
-            raise CompanionModelError("model response crossed the fact boundary")
-        return reply
+            raise CompanionModelError(
+                "empty model response",
+                reason_code="empty_or_oversize_reply",
+                stage="provider_response",
+            )
+        if len(content) > 4000:
+            raise CompanionModelError(
+                "model reply is empty or too large",
+                reason_code="empty_or_oversize_reply",
+                stage="provider_response",
+            )
+        rejection = model_reply_rejection(content, memories, conversation, profile_memory)
+        if rejection is not None:
+            raise CompanionModelError(
+                "model response crossed an output boundary",
+                reason_code=rejection.code,
+                stage=rejection.stage,
+                rule=rejection.rule,
+                matched_reason_codes=rejection.matched_codes,
+                matched_rules=rejection.matched_rules,
+            )
+        return content
 
     def judge_json(self, *, task: str, context: dict, fields: dict[str, str], fallback: dict) -> tuple[dict, str]:
         """让模型做结构化「内心」判断，返回 (result, source)，source ∈ {"model","fallback"}。

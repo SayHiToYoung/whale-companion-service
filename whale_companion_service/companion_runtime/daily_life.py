@@ -155,8 +155,25 @@ def generate_daily_conditions(now: datetime | None = None, chronotype: dict | No
     return conditions
 
 
+# 哪些 condition 是"此刻才成立"的：它们由当前时刻重算，窗口一过就该消失，
+# 因此永远不属于当日持久条件，也不该被写进 daily_state.conditions_json。
+# 反过来，generate_daily_conditions 产出的 sleep / dream 是当日持久条件。
+# 在这里新增一种按时刻重算的 condition 时，记得把它的 kind 加进来。
+TRANSIENT_CONDITION_KINDS = ("hunger", "transient_life_event")
+
+
+def is_transient_condition(condition: object) -> bool:
+    """判断一条 condition 是否属于"只参与本次计算"的临时条件。"""
+    return (isinstance(condition, dict)
+            and str(condition.get("kind") or "") in TRANSIENT_CONDITION_KINDS)
+
+
 def meal_hunger_condition(now: datetime | None = None, chronotype: dict | None = None) -> dict | None:
-    """到饭点窗口时注入的饥饿条件；未到饭点返回 None。"""
+    """到饭点窗口时注入的饥饿条件；未到饭点返回 None。
+
+    这是**临时**条件（见 `TRANSIENT_CONDITION_KINDS`）：只参与调用当次的状态合成，
+    调用方不得把它写进当日持久条件。
+    """
     moment = now or datetime.now(timezone.utc)
     minute = _minutes_of_day(moment)
     profile = chronotype if isinstance(chronotype, dict) else empty_chronotype()

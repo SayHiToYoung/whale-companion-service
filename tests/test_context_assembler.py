@@ -142,6 +142,9 @@ def test_repository_budget_failure_uses_fallback_without_calling_model(tmp_path,
     result = repo.append_message({"userId": "u", "deviceId": "d", "messageId": "m1", "role": "user", "text": "你好"})
     assert result["assistantMessage"]["text"]
     assert responder.calls == 0
+    trace = repo.debug_snapshot("u")["replyTraces"][0]
+    assert trace["reasonCode"] == "context_budget_exceeded"
+    assert trace["rejectionStage"] == "context_assembler"
 
 
 def test_obsolete_timeline_cannot_leak_through_compatibility_projection():

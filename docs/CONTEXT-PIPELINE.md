@@ -4,7 +4,8 @@
 > 与 [`DESIGN-living-companion.md`](DESIGN-living-companion.md) 冲突时以本文为准——
 > 那份是设计底稿，已被本阶段取代。
 > 架构全景见 [`ARCHITECTURE.md`](ARCHITECTURE.md)；主动开口与关系策略见
-> [`COMPANION-POLICIES.md`](COMPANION-POLICIES.md)；验收口径见 [`ACCEPTANCE.md`](ACCEPTANCE.md)。
+> [`COMPANION-POLICIES.md`](COMPANION-POLICIES.md)；可选外部观察见
+> [`PERCEPTION-INPUTS.md`](PERCEPTION-INPUTS.md)；验收口径见 [`ACCEPTANCE.md`](ACCEPTANCE.md)。
 
 ## 一句话
 
@@ -15,7 +16,8 @@
 
 ```text
 ①  采集与存储          桌宠/手机 → POST /v1/memory/batches → SQLite（不可变原始事件）
-                       └─ 原始事件到此为止。它们永远不直接进模型。
+                       可选感知端 → POST /v1/perception/observations → SQLite（原始 payload）
+                       └─ 原始事件与原始 payload 到此为止。它们永远不直接进模型。
 ②  模块处理层          memory / daily_life / relationship / story / boundaries / …
                        └─ 每个模块只输出 ContextFragment
 ③  仲裁与预算          ContextAssembler.assemble()   ← 唯一入口
@@ -43,6 +45,12 @@
 自称 `user_stated`，进上下文后会被仲裁当成用户亲口说过的话，证据强度凭空升一级。
 宁可丢掉这条记忆。
 
+可选的外部观察走同一条纪律，只是白名单按 `sourceType` 分：
+`perception.perception_fragments()` 是它唯一的通道——过期筛除 → 白名单投影 →
+每来源取最新 → `ContextFragment`，事实来源恒为 `observed`，置信度受该类型上限压制。
+整条感知链路是**可选**的：一条来源都没有时它什么也不加。细则见
+[`PERCEPTION-INPUTS.md`](PERCEPTION-INPUTS.md)。
+
 `safe_value()` 是第二道防线：它按 `_PRIVATE_KEYS` 递归剥掉内部字段
 （`raw*` `audit` `ledger` `evidence` `score` `carryWeight` `activation` `metadata` …），
 并拒绝任何非 JSON、非有限的值。适配器仍然必须显式投影，防线不替代投影。
@@ -62,6 +70,7 @@
 | `MEMORY` | 500 | 记忆与长期事实 |
 | `RELATIONSHIP` | 400 | 关系状态与权限 |
 | `DAILY_LIFE` | 300 | 她的生活节律 |
+| `PERCEPTION` | 250 | 可选外部观察（`Priority.STORY + 50`） |
 | `STORY` | 200 | 共同故事线 |
 | `STYLE` | 100 | 人格与表达 |
 

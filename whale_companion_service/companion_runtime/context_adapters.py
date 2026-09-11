@@ -22,6 +22,7 @@ from .emotion_state import build_emotion_state
 from .expression_learning import expression_context, recall_rules, scene_of, is_learnable
 from .inner_reaction import build_inner_reaction
 from .open_threads import build_open_threads
+from .perception import perception_fragments
 from .affinity import normalize_affinity_state, relationship_constraints
 from .relationship import build_relationship
 from .proactive import proactive_policy_fragment
@@ -154,7 +155,7 @@ def memory_fragments(memories, query, now):
 def collect_context_fragments(*, user_text, conversation, memories, user_facts, boundaries, persona,
                               threads=None, companion_emotion=None, affinity_state=None, daily_state=None,
                               chronotype=None, timeline_events=None, expression_rules=None,
-                              story_provider=None, now=None, **_compat):
+                              story_provider=None, perception=None, now=None, **_compat):
     moment = now or datetime.now(timezone.utc)
     at = moment.isoformat()
     expiry = (moment + timedelta(minutes=10)).isoformat()
@@ -207,7 +208,7 @@ def collect_context_fragments(*, user_text, conversation, memories, user_facts, 
     open_state = build_open_threads(threads or [], now=moment)
     shared = build_shared_scene(user_text, recent)
     relationship = build_relationship(conversation, facts, open_state, affinity_state, boundaries)
-    scene = build_scene([])  # Observations have one provenance-preserving path: memory adapter.
+    scene = build_scene([], now=moment)  # Observations have one provenance-preserving path: memory adapter.
     scene["period"] = daily_life_context(daily_state, chronotype, now=moment)["period"]
     emotion = build_emotion_state(user_text, shared, open_state)
     reaction = build_inner_reaction(shared, relationship, scene, emotion, persona)
@@ -298,6 +299,17 @@ def collect_context_fragments(*, user_text, conversation, memories, user_facts, 
         source_event_ids=("persona:" + hashlib.sha256(canonical(persona).encode()).hexdigest()[:16],), created_at=at, token_budget=18000))
     fragments.extend(story_fragments(story_provider, now=moment))
     fragments.append(proactive_policy_fragment(relationship, now=moment))
+    # 可选感知来源。一条来源都没有时这里什么也不加，聊天链路与从前逐字节相同。
+    # 原始 payload 留在存储里，进上下文的只有按来源类型白名单投影过的最小事实。
+    perception_rows = (perception or {}).get("observations") if isinstance(perception, dict) else perception
+    sensed, perception_trace = perception_fragments(
+        perception_rows, now=moment,
+        sources=(perception or {}).get("sources") if isinstance(perception, dict) else None)
+    fragments.extend(sensed)
+    if perception_rows:
+        # 轨迹是调试数据：它走兼容键，`model_view()` 读不到它。
+        legacy["perception"] = {"trace": perception_trace,
+                                "sources": (perception or {}).get("sources") or []}
     return fragments, recent, legacy
 
 

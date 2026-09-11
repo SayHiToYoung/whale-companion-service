@@ -52,6 +52,74 @@
 其他设备消息的增量恢复、去重和安静状态测试。
 `test_desktop_contract.py` 用真实本地 HTTP 验证桌面客户端与服务端消息一致。
 
+## 第三阶段：状态推进语义审计与可插拔感知输入
+
+> 2026-09-10。本阶段没有重写陪伴算法，没有建第二套记忆，没有改动 memory protocol v1
+> 的任何字段语义，没有删除任何旧客户端兼容字段，也没有实现桌宠进程或 Web Push。
+
+### 状态推进不变式
+
+本项目不采用「所有 GET 禁止写库」这条机械规则。守的是更强的一条：
+**同一输入、同一固定时刻、同一已有状态下，重复调用结果一致，且不重复累计副作用。**
+入口分类与完整审计表见 [`STATE-ADVANCEMENT.md`](STATE-ADVANCEMENT.md)。
+
+主要用例：`tests/test_state_advancement_audit.py`。
+
+| 要求 | 可执行验证 |
+| --- | --- |
+| 固定时钟重复调用 | 18 个读取入口各连读 5 次，答案逐字节相同，库在第一次之后不再变 |
+| 读取顺序无关 | 全部入口正序读一遍、逆序读一遍，终局状态一致 |
+| 服务重启一致性 | 换一个仓库实例（会真的执行迁移逻辑）读出来一致；启动三次副作用不涨 |
+| 重启不凭空造开场 | 回归：启动补齐曾把聊天里的 L3 情绪补成可领取的每日单元 |
+| 多客户端交错读取 | 网页与手机交替读同一批接口，两边逐字节相同；共享历史与游标仍是一份 |
+| 并发 | 8 线程同时读三条会写库的路径，答案唯一、副作用不翻倍 |
+| 并发投递 | 6 线程拿同一个 `deliveryId` 同时落定，最多写出一条主动消息 |
+| 不重复生成事件 | 同一条消息重放 5 次，事件/账本/提及/时间线计数不变 |
+| 不重复账本记录 | 只读评估轮询 20 次，候选队列、发送记录、消息数全不变 |
+| 不重复推进故事 | 同一时刻连读 10 次不走格子；时间过一个月才走，且新时刻上同样幂等 |
+| 不重复主动投递 | 同一个 `deliveryId` 重放 4 次，响应逐字节相同，故事与账本停在原地 |
+| 幂等键命名空间隔离 | 回归：`deliveryId` 不能再被当成 `claimId` 从开场接口读回来 |
+| 老库兼容 | 老位置写下的投递回执在升级后仍然保证重放不多发一条 |
+| 真实 HTTP | 13 条只读路由各 GET 两次，响应体逐字节相同，一轮只读不改库 |
+
+### 可选感知输入
+
+边界见 [`PERCEPTION-INPUTS.md`](PERCEPTION-INPUTS.md)。主要用例：`tests/test_perception_inputs.py`。
+
+| 要求 | 可执行验证 |
+| --- | --- |
+| 感知端完全可选 | 零来源时聊天、回复、帧、只读评估全部照常；空列表投影为空 |
+| 原始 payload 只进存储 | 截图路径/原始采样/窗口标题落库，模型可见面里一个字都搜不到 |
+| adapter 投影 | 唯一通道产出 `ContextFragment`；未知类型收下但不投影，缺证据整条丢弃 |
+| 组装器是唯一入口 | 静态断言 `perception.py` 不导入 sqlite3/网络/仓库，也不自己造帧 |
+| 过期观察不进帧 | 新鲜期一过就不在 `processedFacts` 里；新鲜度按 `observedAt` 而不是 `receivedAt` |
+| 来源离线不声称实时 | 每条投影都带"这是带时刻的观察"；非 `live` 再加一句"它已经不在报数了" |
+| L1 不升格为用户事实 | 事实来源恒为 `observed`，置信度压到类型上限，key 自带 `perception:` 前缀 |
+| 来源在线 ≠ 用户在场 | 接上来源后 `GET /v1/companion/proactive` 答案不变，`proactive_presence` 一行不写 |
+| 调试轨迹 | 逐条记下投影/丢弃与理由，控制台可读、模型读不到、不含原始 payload |
+| 幂等 | 同一个 `observationId` 重传 3 次只有一行，来源计数只加一次 |
+| 契约 | 真实 HTTP 响应过 `PerceptionIngestResponse` / `PerceptionState` schema |
+
+### 错误重试语义
+
+`retryable` 由错误码自己的语义决定，**不由状态码区间决定**。408 与 429 是可重试的 4xx；
+当前没有路径返回它们，先把语义与 `Retry-After` 通道定死。
+`tests/test_client_contract.py` 锁住"可重试的 4xx 只能是这份显式清单"，
+`tests/mobile_sync.test.cjs` 验证 PWA 收到可重试的 429 时把消息留在待发箱、
+退避后带同一个幂等键重放，而不是就地丢掉。
+
+### 本阶段命令与结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | 559 passed, 1 skipped |
+| `node --test tests/mobile_sync.test.cjs` | 15 passed |
+| `python -m compileall -q whale_companion_service tests scripts` | 通过 |
+| `node --check mobile/app.js` / `debug/app.js` / `mobile/sw.js` | 通过 |
+| `git diff --check` | 通过 |
+
+唯一的 skip 是 `tests/test_desktop_contract.py`——同级桌宠仓库不存在。
+
 ## 临时数据库运行记录
 
 完整用例 `test_runtime_share_agenda_delivery_mobile_reply_and_solicited_cap`：

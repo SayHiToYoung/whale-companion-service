@@ -131,7 +131,7 @@ function pipelineItem(title, stateName, detail) {
   const li = document.createElement("li");
   li.dataset.state = stateName;
   const badge = document.createElement("b");
-  badge.textContent = stateName === "ok" ? "已有证据" : stateName === "error" ? "连接失败" : "等待数据";
+  badge.textContent = stateName === "ok" ? "已有证据" : stateName === "error" ? "连接失败" : stateName === "optional" ? "可选未接入" : "等待数据";
   const strong = document.createElement("strong"); strong.textContent = title;
   const small = document.createElement("small"); small.textContent = detail;
   li.append(badge, strong, small);
@@ -147,8 +147,8 @@ function renderPipeline() {
   const memories = service?.memories || [];
   const refs = service?.conversationMemoryRefs || [];
   const items = [
-    ["桌面采集", desktop ? (facts.length ? "ok" : "empty") : "error", desktop ? `${selectedDate()} · ${facts.length} 条 L1 事实` : "桌宠端口不可用"],
-    ["整理 outbox", desktop ? (pending ? "ok" : "empty") : "error", desktop ? `${pending} 个待确认批次` : "无法读取本地 outbox"],
+    ["桌面采集（可选）", desktop ? (facts.length ? "ok" : "empty") : "optional", desktop ? `${selectedDate()} · ${facts.length} 条 L1 事实` : "桌宠未接入，不影响核心对话"],
+    ["整理 outbox（可选）", desktop ? (pending ? "ok" : "empty") : "optional", desktop ? `${pending} 个待确认批次` : "没有可选桌面 outbox"],
     ["服务 ACK", service ? (batches.length ? "ok" : "empty") : "error", service ? `${batches.length} 个已接收批次` : "共享服务不可用"],
     ["记忆入库", service ? (memories.length ? "ok" : "empty") : "error", service ? `${memories.length} 条服务端记忆` : "无法读取 SQLite"],
     ["开场引用", service ? (refs.length || state.opening?.focusMemoryId ? "ok" : "empty") : "error", state.opening?.focusMemoryId || refs[0]?.memory_id || "尚未引用记忆"],
@@ -207,12 +207,12 @@ function renderRelationship(service) {
   const identity = service?.identity || {};
   const desktopIdentity = state.desktop?.identity || {};
   const samePet = Boolean(identity.petId && desktopIdentity.petId && identity.petId === desktopIdentity.petId);
-  $("#identity-status").textContent = samePet ? "两端一致" : "待核对";
+  $("#identity-status").textContent = !state.desktop ? "桌宠未接入（可选）" : samePet ? "两端一致" : "待核对";
   const identityRoot = $("#identity-details"); identityRoot.replaceChildren();
   const identityItem = document.createElement("article"); identityItem.className = "memory-row";
   const identityTitle = document.createElement("strong"); identityTitle.textContent = `${identity.productName || "回声"} · ${identity.petId || "未知 petId"}`;
   const identityDetail = document.createElement("p"); identityDetail.className = "memory-detail";
-  identityDetail.textContent = `${identity.desktopName || "小鲸"} ⇄ ${identity.mobileName || "大鲸"} · ${identity.identityVersion || "版本未知"} · 桌面读取 ${desktopIdentity.petId || "失败"}`;
+  identityDetail.textContent = `${identity.desktopName || "小鲸"} ⇄ ${identity.mobileName || "大鲸"} · ${identity.identityVersion || "版本未知"} · ${state.desktop ? `桌面读取 ${desktopIdentity.petId || "失败"}` : "独立服务模式"}`;
   identityItem.append(identityTitle, identityDetail); identityRoot.append(identityItem);
   const dialogue = service?.dialogueState || {phase:"idle", turn:0};
   const mind = service?.companionMind || {};
@@ -491,10 +491,12 @@ function render() {
   renderLiving(state.service);
   renderPipeline();
   const health = $("#health");
-  const both = Boolean(state.desktop && state.service);
-  health.dataset.state = both ? "ok" : "error";
-  health.querySelector("strong").textContent = both ? "链路可以验证" : "链路尚未连通";
-  $("#health-detail").textContent = both ? "桌宠与共享服务均在线" : `${state.desktop ? "桌宠在线" : "桌宠离线"} / ${state.service ? "服务在线" : "服务离线"}`;
+  const serviceReady = Boolean(state.service);
+  health.dataset.state = serviceReady ? "ok" : "error";
+  health.querySelector("strong").textContent = serviceReady ? "独立服务可用" : "服务尚未连通";
+  $("#health-detail").textContent = serviceReady
+    ? `服务在线 / ${state.desktop ? "可选桌宠在线" : "桌宠未接入（可选）"}`
+    : "共享服务离线";
 }
 
 async function refresh() {
@@ -508,11 +510,12 @@ async function refresh() {
   state.desktop = desktop.status === "fulfilled" ? desktop.value : null;
   state.service = service.status === "fulfilled" ? service.value : null;
   render();
-  if (!state.desktop || !state.service) {
+  if (!state.service) {
     const messages = [];
-    if (!state.desktop) messages.push(`桌宠：${desktop.reason?.message || "连接失败"}`);
     if (!state.service) messages.push(`服务：${service.reason?.message || "连接失败"}`);
     setStatus(messages.join("；"), "error");
+  } else if (!state.desktop) {
+    setStatus("服务已刷新。桌宠未接入（可选），核心对话可独立运行。", "ok");
   } else setStatus("已刷新。所有数字都来自当前真实状态。", "ok");
 }
 

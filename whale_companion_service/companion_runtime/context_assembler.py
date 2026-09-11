@@ -159,7 +159,8 @@ class ContextAssembler:
                                      "usedTokens": token_cost(frame.model_view()), "moduleUsage": dict(sorted(used.items()))}
         # Existing consumers can inspect old processed state shapes, but model_view never reads these.
         legacy_keys = {"sharedScene", "relationship", "scene", "emotion", "openThreads", "innerReaction",
-                       "turnDecision", "speechStyle", "safety", "dailyLife", "selfTimeline", "learnedExpressions", "companionEmotion"}
+                       "turnDecision", "speechStyle", "safety", "dailyLife", "selfTimeline", "learnedExpressions",
+                       "companionEmotion", "perception"}
         def redact(value):
             if isinstance(value, str):
                 return value if allowed(value) else ""

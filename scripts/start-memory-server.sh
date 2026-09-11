@@ -9,7 +9,7 @@ if curl -fsS --max-time 1 http://127.0.0.1:47821/health >/dev/null 2>&1; then
 fi
 
 mkdir -p .run
-PYTHON_BIN="${WHALE_PYTHON:-/Users/yuyangwei/DeepSeek/dsh-pet-indesktop/.venv/bin/python}"
+PYTHON_BIN="${WHALE_PYTHON:-python3}"
 
 "$PYTHON_BIN" - "$PWD" "$PYTHON_BIN" <<'PYEOF'
 import os

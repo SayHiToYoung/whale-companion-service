@@ -1,7 +1,7 @@
 {
   "name": "大鲸",
   "short_name": "大鲸",
-  "description": "读取小鲸送来的共享记忆，在你有空时陪你聊聊。",
+  "description": "连接独立陪伴服务，在不同设备上延续同一份记忆与对话。",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

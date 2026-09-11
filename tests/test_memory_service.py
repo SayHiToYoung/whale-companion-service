@@ -496,7 +496,7 @@ def test_short_emotional_dialogue_keeps_topic_then_respects_stop() -> None:
     first = build_grounded_companion_reply(
         "工作上的事", [], conversation=first_conversation,
     )
-    assert "工作上的事" in first
+    assert "这件事" in first and "工作上的事" not in first
     assert "叹气" in first
     assert first.count("？") == 1
 
@@ -507,7 +507,7 @@ def test_short_emotional_dialogue_keeps_topic_then_respects_stop() -> None:
     second = build_grounded_companion_reply(
         "感觉自己没做好", [], conversation=second_conversation,
     )
-    assert "感觉自己没做好" in second
+    assert "这件事" in second and "感觉自己没做好" not in second
     assert "怎么了" not in second
     assert second.count("？") == 1
 

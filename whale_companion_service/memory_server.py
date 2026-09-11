@@ -17,6 +17,12 @@ from .companion_mind import build_companion_mind, contextual_fallback
 from .companion_runtime.context_adapters import build_reply_frame as build_companion_frame
 from .companion_runtime.companion_emotion import empty_companion_emotion, update_companion_emotion
 from .companion_runtime.open_threads import build_open_threads
+from .companion_runtime.perception import (
+    PerceptionError,
+    normalize_observation,
+    perception_debug_view,
+    source_states,
+)
 from .companion_runtime.proactive_expression import render_proactive
 from .companion_runtime.proactive import decide_proactive_speak, evaluate_proactive_lifecycle
 from .standing_knowledge import derive_standing_knowledge, standing_knowledge_context
@@ -36,6 +42,7 @@ from .companion_runtime.daily_life import (
     advance_agenda,
     agenda_candidate_signals,
     compose_daily_state,
+    is_transient_condition,
     transient_conditions,
     transient_life_events,
     empty_chronotype,
@@ -52,14 +59,20 @@ from .companion_runtime.story import (
     apply_story_gates,
     choose_branch,
     eligible_templates,
+    order_arcs,
     refuse_arc,
     select_current_arcs,
     start_arc,
     story_candidate_signals,
 )
 from .emotion import explicit_emotion_label
-from .companion_llm import CompanionResponder
-from .companion_llm import PROMPT_VERSION, SYSTEM_PROMPT, build_model_context, reply_violates_boundaries, reply_has_style_violation
+from .companion_llm import CompanionModelError, CompanionResponder, REJECTION_CODES
+from .companion_llm import (
+    PROMPT_VERSION,
+    SYSTEM_PROMPT,
+    build_model_context,
+    model_reply_rejection,
+)
 from .memory_activation import SHARED_EXPERIENCE
 from .memory_digest import DIGEST_KINDS, build_memory_digest, digest_periods
 from .memory_lifecycle import (
@@ -67,6 +80,18 @@ from .memory_lifecycle import (
     decorate_memory_lifecycle,
     lifecycle_transition_from_text,
     memory_is_speakable,
+)
+from .client_contract import (
+    ApiError,
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    CONTRACT,
+    CONTRACT_PATH,
+    api_descriptor,
+    code_for_message,
+    error_envelope,
+    normalize_client,
+    retry_after_seconds,
 )
 from .memory_protocol import (
     ProtocolError,
@@ -90,6 +115,10 @@ IDENTITY_VERSION = "echo-identity-v1"
 CANONICAL_PET_ID = "shenshen"
 # 被两个人聊到过这么多轮之后，一条情绪就不再只是那天的情绪，而是共同经历。
 SHARED_EXPERIENCE_MENTIONS = 2
+# 一次最多收多少条观察、每个来源留多少条、一轮上下文最多读多少条。
+PERCEPTION_MAX_BATCH = 200
+PERCEPTION_RETAINED_PER_SOURCE = 200
+PERCEPTION_CONTEXT_LIMIT = 60
 # 主动消息发出后这么久之内的用户回应，算"被钓出来的"，涨分额度另计。
 SOLICITED_REPLY_WINDOW_MINUTES = 30.0
 
@@ -134,6 +163,84 @@ class MemoryConflictError(RuntimeError):
     pass
 
 
+_GROUNDING_REJECTION_CODES = frozenset({
+    "unsupported_desktop_claim",
+    "unsupported_duration_claim",
+    "unsupported_progress_claim",
+    "emotion_without_evidence",
+    "unknown_grounding_violation",
+})
+
+
+def _legacy_rejection_reason(code: str, *, exception_name: str = "") -> str:
+    """Keep the existing human/debug field while reasonCode is the contract."""
+    if exception_name:
+        return exception_name
+    if code == "provider_unavailable":
+        return "model_unavailable"
+    if code == "context_budget_exceeded":
+        return "context_budget_exceeded"
+    if code == "empty_or_oversize_reply":
+        return "empty_response"
+    if code == "user_boundary_violation":
+        return "boundary_violation"
+    if code == "style_violation":
+        return "style_violation"
+    if code in _GROUNDING_REJECTION_CODES:
+        return "grounding_violation"
+    return ""
+
+
+def _fallback_classification(*, attempted: bool, code: str, source: str) -> str:
+    if source != "fallback":
+        return "not_fallback"
+    if not attempted and code == "provider_unavailable":
+        return "configured_fallback"
+    if not attempted:
+        return "preflight_rejection"
+    if code.startswith("provider_") or code == "empty_or_oversize_reply":
+        return "provider_failure"
+    return "output_rejection"
+
+
+def _trace_frame_summary(frame: dict) -> dict:
+    """Non-content diagnostics only; never persist a complete CompanionFrame."""
+    metadata = frame.get("internalMetadata") if isinstance(frame, dict) else {}
+    facts = frame.get("processedFacts") if isinstance(frame, dict) else []
+    instructions = frame.get("moduleInstructions") if isinstance(frame, dict) else []
+    conversation = frame.get("recentConversation") if isinstance(frame, dict) else []
+    modules = sorted({
+        str(row.get("module") or "") for row in list(facts or []) + list(instructions or [])
+        if isinstance(row, dict) and row.get("module")
+    })
+    return {
+        "version": str(frame.get("version") or "") if isinstance(frame, dict) else "",
+        "generationBlocked": bool(
+            isinstance(metadata, dict) and metadata.get("generationBlocked")
+        ),
+        "processedFactCount": len(facts or []),
+        "instructionCount": len(instructions or []),
+        "recentConversationCount": len(conversation or []),
+        "modules": modules,
+        "usedTokens": int((metadata or {}).get("usedTokens") or 0)
+        if isinstance(metadata, dict) else 0,
+    }
+
+
+def _trace_retrieval_summary(trace: dict) -> dict:
+    """Keep retrieval diagnostics useful without persisting the query or fact text."""
+    source = trace if isinstance(trace, dict) else {}
+    selected = source.get("selectedMemoryIds")
+    return {
+        "strategy": str(source.get("strategy") or ""),
+        "candidateCount": int(source.get("candidateCount") or 0),
+        "selectedCount": len(selected) if isinstance(selected, list) else 0,
+        "omittedCount": int(source.get("omittedCount") or 0),
+        "contextChars": int(source.get("contextChars") or 0),
+        "contextBudgetChars": int(source.get("contextBudgetChars") or 0),
+    }
+
+
 class MemoryRepository:
     def __init__(self, path: Path | str, responder: CompanionResponder | None = None,
                  clock=None) -> None:
@@ -148,6 +255,11 @@ class MemoryRepository:
         self._status_lock = threading.Lock()
         self._last_reply_source = ""
         self._last_reply_at = ""
+        self._last_rejection_code = ""
+        self._last_rejection_stage = ""
+        # Runtime-only handoff for deterministic evaluation. Full frames are not
+        # persisted in reply_traces.
+        self._last_reply_frame = None
         self._initialize()
 
     def _now(self) -> str:
@@ -512,6 +624,67 @@ class MemoryRepository:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(user_id)
                 );
+                -- 一次性迁移的记账表。有些补齐只该在"从旧版本升上来"的那一次跑：
+                -- 每次启动都跑的话，重启本身就成了一条会改变状态的路径。
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                -- 第三阶段新增：可插拔感知输入。两张表都是**存储**，不是上下文。
+                -- 原始 payload 只落在这里；进模型的只有 perception.py 按来源类型
+                -- 白名单投影出来的最小事实。没有任何来源时这两张表是空的，聊天照旧。
+                CREATE TABLE IF NOT EXISTS perception_sources (
+                    user_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    first_seen_at TEXT NOT NULL,
+                    last_observed_at TEXT NOT NULL DEFAULT '',
+                    last_received_at TEXT NOT NULL DEFAULT '',
+                    observation_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(user_id, source_id)
+                );
+                CREATE TABLE IF NOT EXISTS perception_observations (
+                    user_id TEXT NOT NULL,
+                    observation_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    freshness_seconds REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    evidence_ref TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(user_id, observation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_perception_observations_recent
+                    ON perception_observations(user_id, source_id, observed_at DESC);
+                -- 主动投递回执。此前它和开场领取共用 opening_claims，靠写死的
+                -- device_id='proactive' 区分——于是一个把 deviceId 报成 "proactive"
+                -- 的客户端，用某个 deliveryId 当 claimId 就能从开场接口拿回一份投递响应，
+                -- 形状还对不上 OpeningClaim 契约。两个幂等键的作用域本来就不同
+                -- （deliveryId 是 (userId)，claimId 是 (userId, deviceId)），各占一张表。
+                CREATE TABLE IF NOT EXISTS proactive_deliveries (
+                    user_id TEXT NOT NULL,
+                    delivery_id TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, delivery_id)
+                );
+                -- 第二阶段新增：客户端身份声明。纯观测表，不参与任何陪伴决策。
+                -- 不声明身份的旧客户端在这里一行都不留，行为与从前完全相同。
+                CREATE TABLE IF NOT EXISTS client_sessions (
+                    user_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT '',
+                    version TEXT NOT NULL DEFAULT '',
+                    api_version INTEGER NOT NULL DEFAULT 0,
+                    capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, client_id)
+                );
             """)
             thread_columns = {row[1] for row in db.execute("PRAGMA table_info(emotional_threads)")}
             for name, definition in (
@@ -536,38 +709,62 @@ class MemoryRepository:
             ledger_columns = {row[1] for row in db.execute("PRAGMA table_info(relationship_ledger)")}
             if "solicited" not in ledger_columns:
                 db.execute("ALTER TABLE relationship_ledger ADD COLUMN solicited INTEGER NOT NULL DEFAULT 0")
+            # 老库里的投递回执躺在 opening_claims 的 device_id='proactive' 行上。
+            # 搬过来而不是留在原地读：留在原地就等于把命名空间碰撞一起保留下来。
             db.execute(
-                """INSERT OR IGNORE INTO emotional_thread_memories
-                   (user_id, thread_id, memory_id, created_at)
-                   SELECT user_id, thread_id, memory_id, opened_at FROM emotional_threads"""
+                """INSERT OR IGNORE INTO proactive_deliveries
+                   (user_id, delivery_id, response_json, created_at)
+                   SELECT user_id, claim_id, response_json, created_at
+                   FROM opening_claims WHERE device_id='proactive'"""
             )
-            # 兼容升级前已入库的事实：只补齐缺失的每日单元，不改已有消费状态。
-            for row in db.execute(
-                "SELECT user_id, memory_id, payload_json, received_at FROM memory_events"
-            ).fetchall():
-                memory = json.loads(row["payload_json"])
-                local_date = self._memory_local_date(memory)
-                if not local_date:
-                    continue
-                episode_id = f"daily:{local_date}"
+            db.execute("DELETE FROM opening_claims WHERE device_id='proactive'")
+            # ---- 一次性迁移 ----
+            # 下面这段补齐是给"从旧版本升上来的库"的，只该跑一次。
+            #
+            # 每次启动都跑的话，重启本身就成了一条会改变状态的路径：对话里提取出来的
+            # L3 情绪本来不属于任何每日单元（`append_message` 不建单元，只有
+            # `ingest_batch` 建），而补齐会给它补一个 `delivered` 的单元——于是重启之后
+            # 手机能领到一条由刚才那句聊天生成的开场，服务不重启就永远不会发。
+            # 同一份数据不该因为进程重启就多出可投递的东西。
+            applied = {row[0] for row in db.execute("SELECT name FROM schema_migrations")}
+            if "legacy_backfill_v1" not in applied:
                 db.execute(
-                    """INSERT OR IGNORE INTO daily_episodes
-                       (user_id, episode_id, local_date, revision, status, memory_count,
-                        delivered_at, consumed_at, updated_at)
-                       VALUES (?, ?, ?, 1, 'delivered', 0, ?, '', ?)""",
-                    (row["user_id"], episode_id, local_date, row["received_at"], row["received_at"]),
+                    """INSERT OR IGNORE INTO emotional_thread_memories
+                       (user_id, thread_id, memory_id, created_at)
+                       SELECT user_id, thread_id, memory_id, opened_at FROM emotional_threads"""
+                )
+                # 兼容升级前已入库的事实：只补齐缺失的每日单元，不改已有消费状态。
+                for row in db.execute(
+                    "SELECT user_id, memory_id, payload_json, received_at FROM memory_events"
+                ).fetchall():
+                    memory = json.loads(row["payload_json"])
+                    local_date = self._memory_local_date(memory)
+                    if not local_date:
+                        continue
+                    episode_id = f"daily:{local_date}"
+                    db.execute(
+                        """INSERT OR IGNORE INTO daily_episodes
+                           (user_id, episode_id, local_date, revision, status, memory_count,
+                            delivered_at, consumed_at, updated_at)
+                           VALUES (?, ?, ?, 1, 'delivered', 0, ?, '', ?)""",
+                        (row["user_id"], episode_id, local_date,
+                         row["received_at"], row["received_at"]),
+                    )
+                    db.execute(
+                        """INSERT OR IGNORE INTO daily_episode_memories
+                           (user_id, episode_id, memory_id) VALUES (?, ?, ?)""",
+                        (row["user_id"], episode_id, row["memory_id"]),
+                    )
+                db.execute(
+                    """UPDATE daily_episodes SET memory_count=(
+                         SELECT COUNT(*) FROM daily_episode_memories AS membership
+                         WHERE membership.user_id=daily_episodes.user_id
+                           AND membership.episode_id=daily_episodes.episode_id)"""
                 )
                 db.execute(
-                    """INSERT OR IGNORE INTO daily_episode_memories
-                       (user_id, episode_id, memory_id) VALUES (?, ?, ?)""",
-                    (row["user_id"], episode_id, row["memory_id"]),
+                    "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+                    ("legacy_backfill_v1", self._now()),
                 )
-            db.execute(
-                """UPDATE daily_episodes SET memory_count=(
-                     SELECT COUNT(*) FROM daily_episode_memories AS membership
-                     WHERE membership.user_id=daily_episodes.user_id
-                       AND membership.episode_id=daily_episodes.episode_id)"""
-            )
 
     @staticmethod
     def _memory_time(memory: dict) -> str:
@@ -664,6 +861,7 @@ class MemoryRepository:
             memories.append(decorate_memory_lifecycle(
                 memory,
                 lifecycle.get(str(memory.get("id") or "")),
+                now=self._clock(),
             ))
         return memories
 
@@ -1342,12 +1540,15 @@ class MemoryRepository:
             chronotype=living["chronotype"], timeline_events=living["timeline"], story_provider=living["story"],
             expression_rules=living["expressions"],
         )
-        reply = contextual_fallback(text, conversation, mind)
+        reply = contextual_fallback(
+            text, conversation, mind,
+            profile["companionFrame"].get("turnDecision"), profile["companionFrame"],
+        )
         source = "fallback"
         if self.responder is not None and self.responder.available and not profile["companionFrame"].generation_blocked:
             try:
                 candidate = str(self.responder.reply(memories, conversation, profile) or "").strip()
-                if candidate and not reply_violates_boundaries(candidate, profile) and not reply_has_style_violation(candidate, text):
+                if model_reply_rejection(candidate, memories, conversation, profile) is None:
                     reply, source = candidate, "model"
             except Exception:
                 pass
@@ -1626,6 +1827,9 @@ class MemoryRepository:
                 persona_state = self._persona_card_locked(db, user_id)
                 companion_emotion = self._companion_emotion_locked(db, user_id)
                 living = self._living_companion_inputs_locked(db, user_id)
+                # 感知刻意不走 living inputs：主动链路读的就是那一份，
+                # 从结构上就没有"来源在线 → 当成用户在场"这条路。
+                perception = self._perception_locked(db, user_id, self._clock())
                 confirmed_rows = db.execute(
                     """SELECT insight_json FROM insight_reviews
                        WHERE user_id=? AND status='confirmed' ORDER BY updated_at DESC LIMIT 20""",
@@ -1660,61 +1864,115 @@ class MemoryRepository:
                 threads=open_threads, companion_emotion=companion_emotion,
                 affinity_state=living["affinity"], daily_state=living["daily"],
                 chronotype=living["chronotype"], timeline_events=living["timeline"], story_provider=living["story"],
-                expression_rules=living["expressions"],
+                expression_rules=living["expressions"], perception=perception,
                 now=self._clock(),
             )
             fallback_kind = "grounded_memory" if is_direct_memory_question(user_text) else "contextual"
             transition, _transition_reason = lifecycle_transition_from_text(user_text)
             if is_reaction_to_companion(user_text):
-                reply_text = contextual_fallback(user_text, conversation, mind, profile["companionFrame"].get("turnDecision"))
+                reply_text = contextual_fallback(
+                    user_text, conversation, mind,
+                    profile["companionFrame"].get("turnDecision"), profile["companionFrame"],
+                )
             elif (
                 not is_direct_memory_question(user_text)
                 and not is_prompt_to_speak(user_text)
                 and not transition
                 and mind["intent"] != "boundary"
             ):
-                reply_text = contextual_fallback(user_text, conversation, mind, profile["companionFrame"].get("turnDecision"))
+                reply_text = contextual_fallback(
+                    user_text, conversation, mind,
+                    profile["companionFrame"].get("turnDecision"), profile["companionFrame"],
+                )
             reply_source = "fallback"
             responder = self.responder
+            frame_summary = _trace_frame_summary(profile["companionFrame"])
+            initial_code = "provider_unavailable" if responder is None or not responder.available else ""
             trace = {
                 "replyMessageId": reply_id,
-                "userText": user_text,
                 "intent": profile["companionFrame"].get("sharedScene", {}).get("intent", ""),
                 "route": "model_first" if responder is not None and responder.available else "fallback_only",
                 "fallbackKind": fallback_kind,
                 "selectedMemoryIds": [str(row.get("id") or "") for row in memories if row.get("id")],
-                "memoryRetrieval": retrieval_trace,
+                "memoryRetrieval": _trace_retrieval_summary(retrieval_trace),
                 "focusMemoryId": focus_memory_id,
-                "companionFrame": profile["companionFrame"],
+                # Compatibility key retained, but reply traces no longer persist the
+                # full frame or conversation content. The live debug snapshot still
+                # exposes its separately assembled current CompanionFrame.
+                "companionFrame": {
+                    "version": frame_summary["version"],
+                    "generationBlocked": frame_summary["generationBlocked"],
+                },
+                "contextSummary": frame_summary,
                 "model": str(responder.name) if responder is not None and responder.available else "",
                 "modelAttempted": False,
                 "modelAccepted": False,
-                "rejectionReason": "model_unavailable" if responder is None or not responder.available else "",
+                "rejectionReason": _legacy_rejection_reason(initial_code),
+                "reasonCode": initial_code,
+                "rejectionStage": "configuration" if initial_code else "",
+                "rejectionRule": "",
+                "matchedReasonCodes": [initial_code] if initial_code else [],
+                "matchedRejectionRules": [],
             }
             if profile["companionFrame"].generation_blocked:
                 trace["route"] = "fallback_only"
                 trace["rejectionReason"] = "context_budget_exceeded"
+                trace["reasonCode"] = "context_budget_exceeded"
+                trace["rejectionStage"] = "context_assembler"
+                trace["matchedReasonCodes"] = ["context_budget_exceeded"]
             if responder is not None and responder.available and not profile["companionFrame"].generation_blocked:
                 trace["modelAttempted"] = True
                 try:
                     candidate = str(responder.reply(
                         memories, [{"role": r["role"], "text": r["text"]} for r in conversation], profile,
                     ) or "").strip()
-                    if not candidate:
-                        trace["rejectionReason"] = "empty_response"
-                    elif reply_violates_boundaries(candidate, profile):
-                        trace["rejectionReason"] = "boundary_violation"
-                    elif reply_has_style_violation(candidate, user_text):
-                        trace["rejectionReason"] = "style_violation"
+                    rejection = model_reply_rejection(candidate, memories, conversation, profile)
+                    if rejection is not None:
+                        # The repository is the trust boundary.  A custom responder (or a
+                        # future provider implementation) must not be able to bypass the
+                        # same fact checks enforced by ModelCompanionResponder.
+                        trace["reasonCode"] = rejection.code
+                        trace["rejectionStage"] = rejection.stage
+                        trace["rejectionRule"] = rejection.rule
+                        trace["matchedReasonCodes"] = list(rejection.matched_codes)
+                        trace["matchedRejectionRules"] = list(rejection.matched_rules)
+                        trace["rejectionReason"] = _legacy_rejection_reason(rejection.code)
                     else:
-                        reply_text = candidate[:4000]
+                        reply_text = candidate
                         reply_source = "model"
                         trace["modelAccepted"] = True
                         trace["rejectionReason"] = ""
+                        trace["reasonCode"] = ""
+                        trace["rejectionStage"] = ""
+                        trace["rejectionRule"] = ""
+                        trace["matchedReasonCodes"] = []
+                        trace["matchedRejectionRules"] = []
+                except CompanionModelError as exc:
+                    trace["reasonCode"] = exc.reason_code
+                    trace["rejectionStage"] = exc.stage
+                    trace["rejectionRule"] = exc.rule
+                    trace["matchedReasonCodes"] = list(exc.matched_reason_codes)
+                    trace["matchedRejectionRules"] = list(exc.matched_rules)
+                    trace["rejectionReason"] = _legacy_rejection_reason(
+                        exc.reason_code, exception_name=type(exc).__name__,
+                    )
+                    reply_source = "fallback"
                 except Exception as exc:
-                    trace["rejectionReason"] = type(exc).__name__
+                    trace["reasonCode"] = "provider_unavailable"
+                    trace["rejectionStage"] = "responder"
+                    trace["rejectionRule"] = ""
+                    trace["matchedReasonCodes"] = ["provider_unavailable"]
+                    trace["matchedRejectionRules"] = []
+                    trace["rejectionReason"] = _legacy_rejection_reason(
+                        "provider_unavailable", exception_name=type(exc).__name__,
+                    )
                     reply_source = "fallback"
             trace["finalSource"] = reply_source
+            trace["fallbackClassification"] = _fallback_classification(
+                attempted=bool(trace["modelAttempted"]),
+                code=str(trace["reasonCode"]),
+                source=reply_source,
+            )
 
             reply_time = self._now()
             with self._connect() as db:
@@ -1761,6 +2019,9 @@ class MemoryRepository:
             with self._status_lock:
                 self._last_reply_source = reply_source
                 self._last_reply_at = reply_time
+                self._last_rejection_code = str(trace["reasonCode"])
+                self._last_rejection_stage = str(trace["rejectionStage"])
+                self._last_reply_frame = profile["companionFrame"]
             return self._message_payload(stored), reply_source
 
     @staticmethod
@@ -1975,6 +2236,18 @@ class MemoryRepository:
 
     @staticmethod
     def _daily_state_locked(db: sqlite3.Connection, user_id: str, now: datetime) -> dict:
+        """读出此刻的生活状态。**读取是幂等的**：同一时刻读多少次结果都一样。
+
+        当日条件分两类，这条界线是本方法的全部要点：
+
+        - **持久条件**（`sleep` / `dream`）由 `generate_daily_conditions` 当日首次生成，
+          写进 `conditions_json`，当天之内不再变。
+        - **临时条件**（`hunger` / `transient_life_event`）按此刻重算，只参与本次
+          `compose_daily_state`，**永不落库**。窗口一过它们就该消失，而不是留在当日流水里。
+
+        曾经 hunger 被连同持久条件一起写回，于是下一次读取又追加一次，饭点内每读一次
+        energy 掉 6。现在落库的永远只有过滤后的持久条件，读取因此不再改变状态。
+        """
         chronotype = MemoryRepository._chronotype_locked(db, user_id)
         date = now.strftime("%Y-%m-%d")
         row = db.execute(
@@ -1982,26 +2255,36 @@ class MemoryRepository:
             (user_id, date),
         ).fetchone()
         if row is None:
-            conditions = generate_daily_conditions(now, chronotype)
+            stored = generate_daily_conditions(now, chronotype)
         else:
             try:
-                conditions = json.loads(row["conditions_json"])
+                stored = json.loads(row["conditions_json"])
             except (ValueError, TypeError):
-                conditions = generate_daily_conditions(now, chronotype)
+                stored = generate_daily_conditions(now, chronotype)
+        if not isinstance(stored, list):
+            stored = generate_daily_conditions(now, chronotype)
+        # 旧版本可能已经把一条或多条 hunger 写进了 conditions_json。这里在读取时把
+        # 临时条件一律滤掉，旧库因此自愈；下面的写回会把清理后的结果落定。
+        # 其它持久 condition 原样保留，含义不变。
+        persistent = [item for item in stored
+                      if isinstance(item, dict) and not is_transient_condition(item)]
+
+        transient = []
         hunger = meal_hunger_condition(now, chronotype)
         if hunger is not None:
-            conditions = conditions + [hunger]
-        # 临时生活事件按日期种子确定性重算，只有此刻还在窗口里的才计入状态；
-        # 它们不写进 conditions_json，因为窗口一过它们就该消失，而不是留在当日流水里。
-        live = active_transient_events(transient_life_events(now, chronotype), now)
-        state = compose_daily_state(conditions + transient_conditions(live), now, chronotype)
+            transient.append(hunger)
+        # 临时生活事件按日期种子确定性重算，只有此刻还在窗口里的才计入状态。
+        transient.extend(transient_conditions(
+            active_transient_events(transient_life_events(now, chronotype), now)))
+
+        state = compose_daily_state(persistent + transient, now, chronotype)
         db.execute(
             """INSERT INTO daily_state (user_id, state_date, conditions_json, state_json, updated_at)
                VALUES (?,?,?,?,?)
                ON CONFLICT(user_id, state_date) DO UPDATE SET
                  conditions_json=excluded.conditions_json,
                  state_json=excluded.state_json, updated_at=excluded.updated_at""",
-            (user_id, date, canonical_json(conditions), canonical_json(state), now.isoformat()),
+            (user_id, date, canonical_json(persistent), canonical_json(state), now.isoformat()),
         )
         return state
 
@@ -2045,6 +2328,133 @@ class MemoryRepository:
                 for r in expression_rows
             ],
         }
+
+    # ---- 可插拔感知输入 ----
+
+    def _perception_locked(self, db: sqlite3.Connection, user_id: str,
+                           now: datetime) -> dict:
+        """取出此刻还可能有效的观察。**只读**：没有任何写入或惰性初始化。
+
+        只取每个来源最近的若干条：新鲜度按 `observedAt` 算，更老的那些无论如何都过期了。
+        原始 payload 在这里读出来交给适配器，但适配器只投影白名单字段——
+        payload 的其余部分到此为止，没有通往模型的路。
+        """
+        rows = db.execute(
+            """SELECT observation_id, source_id, source_type, observed_at, received_at,
+                      expires_at, freshness_seconds, confidence, payload_json, evidence_ref
+               FROM perception_observations WHERE user_id=?
+               ORDER BY observed_at DESC LIMIT ?""",
+            (user_id, PERCEPTION_CONTEXT_LIMIT),
+        ).fetchall()
+        observations = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (ValueError, TypeError):
+                payload = {}
+            observations.append({
+                "observationId": row["observation_id"],
+                "sourceId": row["source_id"],
+                "sourceType": row["source_type"],
+                "observedAt": row["observed_at"],
+                "receivedAt": row["received_at"],
+                "expiresAt": row["expires_at"],
+                "freshnessSeconds": float(row["freshness_seconds"]),
+                "confidence": float(row["confidence"]),
+                "payload": payload if isinstance(payload, dict) else {},
+                "evidenceRef": row["evidence_ref"],
+            })
+        return {"observations": observations,
+                "sources": source_states(observations, now=now)}
+
+    def ingest_perception(self, payload: dict) -> dict:
+        """收下一批外部观察。整条链路可选：没有客户端调它，一切照旧。
+
+        幂等键是 `observationId`，作用域 `(userId)`：同一条观察重传多少次，
+        库里都只有一行，来源计数也只加一次。
+        """
+        user_id = str(payload.get("userId") or "").strip()
+        if not user_id:
+            raise ProtocolError("userId required")
+        rows = payload.get("observations")
+        if rows is None and isinstance(payload.get("observation"), dict):
+            rows = [payload["observation"]]
+        if not isinstance(rows, list) or not rows:
+            raise ProtocolError("invalid perception observation")
+        if len(rows) > PERCEPTION_MAX_BATCH:
+            raise ProtocolError("invalid perception observation")
+        now = self._clock()
+        try:
+            normalized = [normalize_observation(row, received_at=now) for row in rows]
+        except PerceptionError as exc:
+            raise ProtocolError("invalid perception observation") from exc
+
+        stored = 0
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in normalized:
+                cursor = db.execute(
+                    """INSERT OR IGNORE INTO perception_observations
+                       (user_id, observation_id, source_id, source_type, observed_at,
+                        received_at, expires_at, freshness_seconds, confidence,
+                        payload_json, evidence_ref)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (user_id, row["observationId"], row["sourceId"], row["sourceType"],
+                     row["observedAt"], row["receivedAt"], row["expiresAt"],
+                     row["freshnessSeconds"], row["confidence"],
+                     canonical_json(row["payload"]), row["evidenceRef"]),
+                )
+                if not cursor.rowcount:
+                    continue    # 重传：一行都不动，来源计数也不加。
+                stored += 1
+                db.execute(
+                    """INSERT INTO perception_sources
+                       (user_id, source_id, source_type, first_seen_at,
+                        last_observed_at, last_received_at, observation_count)
+                       VALUES (?,?,?,?,?,?,1)
+                       ON CONFLICT(user_id, source_id) DO UPDATE SET
+                         source_type=excluded.source_type,
+                         last_observed_at=MAX(perception_sources.last_observed_at,
+                                              excluded.last_observed_at),
+                         last_received_at=MAX(perception_sources.last_received_at,
+                                              excluded.last_received_at),
+                         observation_count=perception_sources.observation_count+1""",
+                    (user_id, row["sourceId"], row["sourceType"], row["receivedAt"],
+                     row["observedAt"], row["receivedAt"]),
+                )
+                # 每个来源只留最近这么多条。保留数固定、按 observed_at 排序，
+                # 所以同一批重放不会删出第二种结果。
+                db.execute(
+                    """DELETE FROM perception_observations
+                       WHERE user_id=? AND source_id=? AND observation_id NOT IN (
+                         SELECT observation_id FROM perception_observations
+                         WHERE user_id=? AND source_id=?
+                         ORDER BY observed_at DESC, observation_id DESC LIMIT ?)""",
+                    (user_id, row["sourceId"], user_id, row["sourceId"],
+                     PERCEPTION_RETAINED_PER_SOURCE),
+                )
+            state = self._perception_locked(db, user_id, now)
+        return {
+            "accepted": True,
+            "stored": stored,
+            "duplicates": len(normalized) - stored,
+            "sources": state["sources"],
+            "receivedAt": now.isoformat(),
+        }
+
+    def perception_state(self, user_id: str) -> dict:
+        """来源状态与本轮投影/丢弃轨迹。**只读**，且不含任何原始 payload。
+
+        `sources[].state` 描述的是**来源**，不是用户：`live` 只表示这个来源刚刚还在报数，
+        不表示用户在电脑前、有空或者醒着。
+        """
+        if not str(user_id).strip():
+            raise ProtocolError("userId required")
+        now = self._clock()
+        with self._connect() as db:
+            state = self._perception_locked(db, user_id, now)
+        view = perception_debug_view(state["observations"], now=now)
+        return {"userId": user_id, **view}
 
     # ---- 自我时间线 ----
 
@@ -2160,7 +2570,7 @@ class MemoryRepository:
         config = payload.get("config")
         if not isinstance(config, dict):
             raise ProtocolError("config required")
-        now = datetime.now(timezone.utc).isoformat()
+        now = self._now()
         with self._connect() as db:
             current = self._living_config_locked(db, user_id)
             merged = self._merge_config(current, config)
@@ -2217,7 +2627,7 @@ class MemoryRepository:
         sleep = int(payload.get("sleepMinute"))
         if not (0 <= wake < 1440) or not (0 <= sleep < 1440):
             raise ProtocolError("wakeMinute/sleepMinute must be within 0..1439")
-        now = datetime.now(timezone.utc)
+        now = self._clock()
         with self._connect() as db:
             current = self._chronotype_locked(db, user_id)
             current.update({
@@ -2331,8 +2741,10 @@ class MemoryRepository:
         arcs = apply_story_gates(arcs, permissions=permissions,
                                  boundary_state=derive_boundary_state(boundaries),
                                  period=period, now=now)
-        return [advance_arc(arc, {**signals, "daysSinceStart": arc_age_days(arc, now)},
-                            now=now) for arc in arcs]
+        # 顺序归一：刚起线的追加顺序和从库里读回来的顺序本来不同，不归一的话
+        # 同一时刻先读一次和后读一次会拿到两份顺序不同的 arcs——状态没变，答案却变了。
+        return order_arcs([advance_arc(arc, {**signals, "daysSinceStart": arc_age_days(arc, now)},
+                                       now=now) for arc in arcs])
 
     def _tick_story_locked(self, db: sqlite3.Connection, user_id: str, now: datetime) -> list[StoryArc]:
         """推进并落库。只有真的要改变状态的路径才调它。"""
@@ -2522,7 +2934,15 @@ class MemoryRepository:
         return result
 
     def proactive_decision(self, user_id: str, activity: str = "idle") -> dict:
-        """只读评估：轮询这个接口不会改变任何状态，也不算作"已经说过"。"""
+        """只读评估：轮询这个接口不推进任何陪伴状态，也不算作"已经说过"。
+
+        一个诚实的例外：读当日生活状态时会惰性初始化当天的持久条件
+        （`daily_state`，见 `_daily_state_locked`）。那是**当日基线的首次落定**，
+        不是状态推进——它由日期确定性生成，同一时刻重复调用得到逐字节相同的结果，
+        既不会多算一次精力，也不会多出一条候选、账本或消息。
+        主动候选队列、发送记录、故事进度一律不动，那些只由
+        `POST /v1/companion/proactive/deliveries` 推进。
+        """
         if not str(user_id).strip():
             raise ProtocolError("userId required")
         now = self._clock()
@@ -2545,8 +2965,8 @@ class MemoryRepository:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             replay = db.execute(
-                """SELECT response_json FROM opening_claims
-                   WHERE user_id=? AND device_id='proactive' AND claim_id=?""",
+                """SELECT response_json FROM proactive_deliveries
+                   WHERE user_id=? AND delivery_id=?""",
                 (user_id, delivery_id),
             ).fetchone()
             if replay is not None:
@@ -2610,18 +3030,85 @@ class MemoryRepository:
             result["deliveryId"] = delivery_id
             result["committedAt"] = at
             db.execute(
-                """INSERT INTO opening_claims (user_id, device_id, claim_id, response_json, created_at)
-                   VALUES (?, 'proactive', ?, ?, ?)""",
+                """INSERT INTO proactive_deliveries
+                   (user_id, delivery_id, response_json, created_at) VALUES (?, ?, ?, ?)""",
                 (user_id, delivery_id, canonical_json(result), at),
             )
             return result
 
+    def _reply_diagnostics(self, *, user_id: str = "", limit: int = 1000) -> dict:
+        """Aggregate bounded, content-free reason-code diagnostics from traces."""
+        query = "SELECT trace_json, created_at FROM reply_traces"
+        params: list[object] = []
+        if user_id:
+            query += " WHERE user_id=?"
+            params.append(str(user_id))
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        counts = {code: 0 for code in REJECTION_CODES}
+        fallback_counts = {"configured_fallback": 0, "preflight_rejection": 0,
+                           "provider_failure": 0, "output_rejection": 0}
+        latest = None
+        try:
+            with self._connect() as db:
+                rows = db.execute(query, params).fetchall()
+        except sqlite3.Error:
+            rows = []
+        legacy_codes = {
+            "model_unavailable": "provider_unavailable",
+            "CompanionModelError": "provider_unavailable",
+            "RuntimeError": "provider_unavailable",
+            "context_budget_exceeded": "context_budget_exceeded",
+            "empty_response": "empty_or_oversize_reply",
+            "boundary_violation": "user_boundary_violation",
+            "style_violation": "style_violation",
+            "grounding_violation": "unknown_grounding_violation",
+        }
+        for row in rows:
+            try:
+                trace = json.loads(row["trace_json"])
+            except (TypeError, ValueError):
+                continue
+            code = str(trace.get("reasonCode") or "")
+            if code not in counts:
+                code = legacy_codes.get(str(trace.get("rejectionReason") or ""), "")
+            matched = trace.get("matchedReasonCodes")
+            matched_codes = [str(item) for item in matched] if isinstance(matched, list) else []
+            matched_codes = [item for item in matched_codes if item in counts]
+            for matched_code in (matched_codes or ([code] if code in counts else [])):
+                counts[matched_code] += 1
+            classification = str(trace.get("fallbackClassification") or "")
+            if classification in fallback_counts:
+                fallback_counts[classification] += 1
+            if latest is None:
+                latest = {
+                    "source": str(trace.get("finalSource") or ""),
+                    "at": str(row["created_at"] or ""),
+                    "reasonCode": code,
+                    "rejectionStage": str(trace.get("rejectionStage") or ""),
+                    "fallbackClassification": classification,
+                }
+        return {
+            "reasonCodes": list(REJECTION_CODES),
+            "reasonCodeCounts": counts,
+            "fallbackClassificationCounts": fallback_counts,
+            "sampleSize": len(rows),
+            "sampleLimit": max(1, min(int(limit), 1000)),
+            "latest": latest or {
+                "source": "", "at": "", "reasonCode": "",
+                "rejectionStage": "", "fallbackClassification": "",
+            },
+        }
+
     def companion_status(self) -> dict:
         responder = self.responder
         enabled = bool(responder is not None and responder.available)
+        diagnostics = self._reply_diagnostics()
         with self._status_lock:
-            last_source = self._last_reply_source
-            last_at = self._last_reply_at
+            last_source = self._last_reply_source or diagnostics["latest"]["source"]
+            last_at = self._last_reply_at or diagnostics["latest"]["at"]
+            last_code = self._last_rejection_code or diagnostics["latest"]["reasonCode"]
+            last_stage = self._last_rejection_stage or diagnostics["latest"]["rejectionStage"]
         return {
             "modelEnabled": enabled,
             "model": str(responder.name) if enabled else "",
@@ -2629,6 +3116,103 @@ class MemoryRepository:
             "promptVersion": PROMPT_VERSION,
             "lastReplySource": last_source,
             "lastReplyAt": last_at,
+            "lastRejectionCode": last_code,
+            "lastRejectionStage": last_stage,
+            "diagnostics": diagnostics,
+        }
+
+    def last_reply_frame(self) -> dict:
+        """Return the current process's ephemeral frame for tests/debug tooling."""
+        with self._status_lock:
+            frame = self._last_reply_frame
+        return json.loads(canonical_json(frame)) if isinstance(frame, dict) else {}
+
+    def record_client_session(self, user_id: str, client: dict) -> dict:
+        """记下一个客户端的身份声明。声明是可选的，所以这里可以什么都不做。
+
+        这张表只用于观测和多端调试：它不进模型上下文，不参与主动决策，
+        也不改变任何已有数据的含义。
+        """
+        user = str(user_id or "").strip()
+        client_id = str((client or {}).get("clientId") or "").strip()
+        if not user or not client_id:
+            return {"recorded": False}
+        now = self._now()
+        capabilities = canonical_json(list((client or {}).get("capabilities") or []))
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO client_sessions
+                   (user_id, client_id, kind, version, api_version,
+                    capabilities_json, first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, client_id) DO UPDATE SET
+                     kind=excluded.kind, version=excluded.version,
+                     api_version=excluded.api_version,
+                     capabilities_json=excluded.capabilities_json,
+                     last_seen_at=excluded.last_seen_at""",
+                (user, client_id, str(client.get("kind") or ""), str(client.get("version") or ""),
+                 int(client.get("apiVersion") or 0), capabilities, now, now),
+            )
+        return {"recorded": True, "clientId": client_id}
+
+    def client_sessions(self, user_id: str) -> list[dict]:
+        """按最近活跃排序列出声明过身份的客户端。"""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT client_id, kind, version, api_version, capabilities_json,
+                          first_seen_at, last_seen_at
+                   FROM client_sessions WHERE user_id=?
+                   ORDER BY last_seen_at DESC, client_id ASC LIMIT 50""",
+                (str(user_id or "").strip(),),
+            ).fetchall()
+        return [{
+            "clientId": row["client_id"],
+            "kind": row["kind"],
+            "version": row["version"],
+            "apiVersion": int(row["api_version"]),
+            "capabilities": json.loads(row["capabilities_json"]),
+            "firstSeenAt": row["first_seen_at"],
+            "lastSeenAt": row["last_seen_at"],
+        } for row in rows]
+
+    def health_status(self) -> dict:
+        """Report service readiness without requiring any optional client or sensor."""
+        storage_ok = False
+        try:
+            with self._connect() as db:
+                db.execute("SELECT 1 FROM conversation_messages LIMIT 1").fetchone()
+            storage_ok = True
+        except sqlite3.Error:
+            pass
+        companion = self.companion_status()
+        return {
+            "ok": storage_ok,
+            "status": "ready" if storage_ok else "unavailable",
+            "service": "whale-companion-service",
+            "protocolVersion": 1,
+            "storage": {"ok": storage_ok, "kind": "sqlite"},
+            "chat": {
+                "ok": storage_ok,
+                "mode": "model" if companion["modelEnabled"] else "grounded_fallback",
+                "contextAssembler": "required",
+                "companionFrameVersion": "companion-frame-v5",
+            },
+            "clients": {
+                "web": "supported",
+                "mobile": "supported",
+                "desktopPet": "optional",
+                "other": "supported_via_api_v1",
+            },
+            # 客户端契约自描述：读到这里就知道错误码怎么分支、身份要不要发、
+            # 分页上限是多少，不需要靠翻源码或猜。
+            "api": api_descriptor(),
+            "optionalInputs": {
+                "desktopObservation": {
+                    "required": False,
+                    "whenAbsent": "no_observation_facts",
+                },
+            },
+            "companion": companion,
         }
 
     @staticmethod
@@ -2642,19 +3226,28 @@ class MemoryRepository:
             "createdAt": row["created_at"],
         }
 
-    def messages(self, user_id: str, after_message_seq: int = 0, limit: int = 200) -> dict:
+    def messages(
+        self, user_id: str, after_message_seq: int = 0, limit: int = DEFAULT_PAGE_LIMIT,
+    ) -> dict:
+        """按 `afterMessageSeq` 排他游标读同一份共享历史。
+
+        `message_seq` 由服务端分配、全用户单调递增，与写入它的是哪个客户端无关。
+        所以网页、手机和未来的桌宠读到的是同一条有序时间线；断线的客户端把上一次的
+        `nextMessageSeq` 原样递回来就能续上，不需要任何本地重放。
+        """
+        page_limit = max(1, min(MAX_PAGE_LIMIT, int(limit)))
         with self._connect() as db:
-            rows = db.execute(
+            # 多取一条只为回答"后面还有没有"。这条探针不会进入返回的 messages，
+            # 也不会影响 nextMessageSeq——它唯一的作用是让 hasMoreExact 说实话。
+            probed = db.execute(
                 """SELECT message_seq, device_id, message_id, role, text, created_at
                    FROM conversation_messages
                    WHERE user_id=? AND message_seq>?
                    ORDER BY message_seq ASC LIMIT ?""",
-                (
-                    user_id,
-                    max(0, int(after_message_seq)),
-                    max(1, min(500, int(limit))),
-                ),
+                (user_id, max(0, int(after_message_seq)), page_limit + 1),
             ).fetchall()
+        has_more_exact = len(probed) > page_limit
+        rows = probed[:page_limit]
         messages = [{
             "messageSeq": int(row["message_seq"]),
             "deviceId": row["device_id"],
@@ -2666,7 +3259,12 @@ class MemoryRepository:
         return {
             "messages": messages,
             "nextMessageSeq": int(rows[-1]["message_seq"]) if rows else max(0, int(after_message_seq)),
-            "hasMore": len(rows) >= max(1, min(500, int(limit))),
+            # 保留原语义不动：取满一页就说"可能还有"。旧客户端按它翻页时要同时看到
+            # 游标前进才继续，否则最后一页刚好取满时会空转一轮。
+            "hasMore": len(rows) >= page_limit,
+            # 精确信号：真的还有下一条才为 true，最后一页刚好取满时是 false。
+            # 新客户端只看它就够了，不需要再自己拼游标条件。
+            "hasMoreExact": has_more_exact,
         }
 
     def claim_opening(self, payload: dict) -> dict:
@@ -2811,7 +3409,13 @@ class MemoryRepository:
             return response
 
     def debug_snapshot(self, user_id: str, local_date: str = "") -> dict:
-        """Return inspectable evidence for the local development console."""
+        """Return inspectable evidence for the local development console.
+
+        控制台是审计面，所以它必须和主链看同一台钟：帧和模型上下文都按 `self._clock()`
+        构建。用真实墙钟构建的话，注入固定时钟的仿真里连读两次会拿到两份 `created_at`
+        不同的帧——状态没变，快照却变了，审计因此失去意义。
+        """
+        now = self._clock()
         with self._connect() as db:
             rows = db.execute(
                 """SELECT server_seq, device_id, memory_id, payload_json, received_at
@@ -2870,7 +3474,9 @@ class MemoryRepository:
             open_threads = self._open_threads_locked(db, user_id)
             standing = self._standing_knowledge_locked(db, user_id)
             persona_state = self._persona_card_locked(db, user_id)
-            living = self._living_companion_inputs_locked(db, user_id)
+            living = self._living_companion_inputs_locked(db, user_id, now)
+            living_config = self._living_config_locked(db, user_id)
+            perception = self._perception_locked(db, user_id, now)
             review_rows = db.execute(
                 "SELECT insight_id, status, insight_json, updated_at FROM insight_reviews WHERE user_id=?",
                 (user_id,),
@@ -2924,7 +3530,7 @@ class MemoryRepository:
             threads=open_threads,
             affinity_state=living["affinity"], daily_state=living["daily"],
             chronotype=living["chronotype"], timeline_events=living["timeline"], story_provider=living["story"],
-            expression_rules=living["expressions"],
+            expression_rules=living["expressions"], perception=perception, now=now,
         )
         debug_profile["companionFrame"] = current_frame
         return {
@@ -2935,6 +3541,8 @@ class MemoryRepository:
             "episodes": [dict(row) for row in persisted_episodes] or all_episodes,
             "batches": [dict(row) for row in batches],
             "cursors": [dict(row) for row in cursors],
+            # 声明过身份的客户端。多端联调时能一眼看出谁在读同一份历史。
+            "clients": self.client_sessions(user_id),
             "conversationMemoryRefs": [dict(row) for row in refs],
             "emotionalThreads": [dict(row) for row in threads],
             "memoryMentions": [dict(row) for row in mentions],
@@ -2948,6 +3556,7 @@ class MemoryRepository:
                 }
                 for row in trace_rows
             ],
+            "replyDiagnostics": self._reply_diagnostics(user_id=user_id),
             "userFacts": user_facts,
             "boundaries": boundaries,
             "standingKnowledge": standing,
@@ -2969,13 +3578,16 @@ class MemoryRepository:
             "dialogueState": emotional_dialogue_state(recent_conversation),
             "companionMind": current_mind,
             "companionFrame": current_frame,
+            # 感知调试轨迹：来源状态、这一轮投影了什么、丢了什么以及为什么。
+            # 没有来源时是一份空视图，控制台照常渲染。
+            "perception": perception_debug_view(perception["observations"], now=now),
             "living": {
                 "affinity": living["affinity"],
                 "daily": living["daily"],
                 "chronotype": living["chronotype"],
                 "timeline": living["timeline"],
                 "expressions": living["expressions"],
-                "config": self._living_config_locked(db, user_id),
+                "config": living_config,
             },
         }
 
@@ -3009,7 +3621,7 @@ class MemoryRepository:
             "focusMemoryId": focus_id,
             "memoryCount": len(memories),
             "episodeDate": episode_date,
-            "generatedAt": _now(),
+            "generatedAt": self._now(),
             "persisted": False,
         }
 
@@ -3080,11 +3692,15 @@ class MemoryApiServer:
             def log_message(self, fmt, *args):
                 return
 
-            def _json(self, status: int, payload: dict) -> None:
+            def _json(self, status: int, payload: dict, *, retry_after: float = 0.0) -> None:
                 body = canonical_json(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                if retry_after > 0:
+                    # 标准头，给不读 JSON 体的代理和旧客户端。体里的
+                    # retryAfterSeconds 与它同值，两边不会各说各的。
+                    self.send_header("Retry-After", str(int(retry_after)))
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -3092,7 +3708,7 @@ class MemoryApiServer:
                 try:
                     body = path.read_bytes()
                 except OSError:
-                    self._json(404, {"error": "not_found"})
+                    self._error("request.not_found")
                     return
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 self.send_response(200)
@@ -3108,10 +3724,28 @@ class MemoryApiServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _error(self, code: str, detail: str = "", details: dict | None = None) -> None:
+                """所有错误都走这里，客户端因此只需要认识一种形状。
+
+                可不可以重试由错误码自己的语义决定，不由状态码区间决定：
+                408 / 429 是可重试的 4xx，它们说的是"此刻不行"而不是"请求有问题"。
+                """
+                status, payload = error_envelope(code, detail=detail, details=details)
+                self._json(status, payload, retry_after=retry_after_seconds(code))
+
             def _authorized(self) -> bool:
                 value = self.headers.get("Authorization", "")
                 supplied = value[7:] if value.startswith("Bearer ") else ""
                 return bool(expected_token) and hmac.compare_digest(supplied, expected_token)
+
+            def _client(self, body: dict | None = None) -> dict:
+                """可选客户端身份：请求体优先，请求头兜底，两个都没有就是匿名。"""
+                return normalize_client((body or {}).get("client"), headers=self.headers)
+
+            def _note_client(self, user_id: str, body: dict | None = None) -> None:
+                client = self._client(body)
+                if client.get("clientId"):
+                    repository.record_client_session(user_id, client)
 
             def _body(self) -> dict:
                 try:
@@ -3158,14 +3792,16 @@ class MemoryApiServer:
                     self._file(media_routes[parsed.path])
                     return
                 if parsed.path == "/health" and self.command == "GET":
-                    self._json(200, {
-                        "ok": True,
-                        "protocolVersion": 1,
-                        "companion": repository.companion_status(),
-                    })
+                    health = repository.health_status()
+                    self._json(200 if health["ok"] else 503, health)
+                    return
+                if parsed.path == CONTRACT_PATH and self.command == "GET":
+                    # 契约文档和 /health 一样不需要口令：客户端要先看得懂协议，
+                    # 才谈得上配对。文档里没有任何用户数据。
+                    self._json(200, CONTRACT)
                     return
                 if not self._authorized():
-                    self._json(401, {"error": "unauthorized"})
+                    self._error("request.unauthorized", "unauthorized")
                     return
                 if self.command == "POST" and parsed.path == "/v1/memory/batches":
                     self._json(200, repository.ingest_batch(self._body()))
@@ -3196,10 +3832,14 @@ class MemoryApiServer:
                     self._json(200, repository.stream(user_id, after, limit))
                     return
                 if self.command == "POST" and parsed.path == "/v1/companion/openings/claim":
-                    self._json(200, repository.claim_opening(self._body()))
+                    body = self._body()
+                    self._note_client(str(body.get("userId") or ""), body)
+                    self._json(200, repository.claim_opening(body))
                     return
                 if self.command == "POST" and parsed.path == "/v1/conversation/messages":
-                    self._json(200, repository.append_message(self._body()))
+                    body = self._body()
+                    self._note_client(str(body.get("userId") or ""), body)
+                    self._json(200, repository.append_message(body))
                     return
                 if self.command == "GET" and parsed.path == "/v1/profile-memories":
                     query = parse_qs(parsed.query)
@@ -3213,7 +3853,9 @@ class MemoryApiServer:
                     self._json(200, repository.review_insight(self._body()))
                     return
                 if self.command == "POST" and parsed.path == "/v1/companion/proactive/deliveries":
-                    self._json(200, repository.commit_proactive_decision(self._body()))
+                    body = self._body()
+                    self._note_client(str(body.get("userId") or ""), body)
+                    self._json(200, repository.commit_proactive_decision(body))
                     return
                 if self.command == "GET" and parsed.path == "/v1/companion/proactive":
                     query = parse_qs(parsed.query)
@@ -3221,7 +3863,20 @@ class MemoryApiServer:
                     if not user_id:
                         raise ProtocolError("userId required")
                     activity = str((query.get("activity") or ["idle"])[0]).strip() or "idle"
+                    self._note_client(user_id)
                     self._json(200, repository.proactive_decision(user_id, activity))
+                    return
+                if self.command == "POST" and parsed.path == "/v1/perception/observations":
+                    body = self._body()
+                    self._note_client(str(body.get("userId") or ""), body)
+                    self._json(200, repository.ingest_perception(body))
+                    return
+                if self.command == "GET" and parsed.path == "/v1/perception/state":
+                    query = parse_qs(parsed.query)
+                    user_id = str((query.get("userId") or [""])[0]).strip()
+                    if not user_id:
+                        raise ProtocolError("userId required")
+                    self._json(200, repository.perception_state(user_id))
                     return
                 if self.command == "GET" and parsed.path == "/v1/companion/emotion":
                     query = parse_qs(parsed.query)
@@ -3319,7 +3974,8 @@ class MemoryApiServer:
                     if not user_id:
                         raise ProtocolError("userId required")
                     after = int((query.get("afterMessageSeq") or ["0"])[0])
-                    limit = int((query.get("limit") or ["200"])[0])
+                    limit = int((query.get("limit") or [str(DEFAULT_PAGE_LIMIT)])[0])
+                    self._note_client(user_id)
                     self._json(200, repository.messages(user_id, after, limit))
                     return
                 if self.command == "GET" and parsed.path == "/v1/debug/state":
@@ -3345,19 +4001,21 @@ class MemoryApiServer:
                         raise ProtocolError("userId and memoryIds required")
                     self._json(200, repository.delete_debug_memories(user_id, memory_ids))
                     return
-                self._json(404, {"error": "not_found"})
+                self._error("request.not_found", "not_found")
 
             def do_GET(self):  # noqa: N802
                 try:
                     self._dispatch()
+                except ApiError as exc:
+                    self._error(exc.code, str(exc), exc.details or None)
                 except ProtocolError as exc:
-                    self._json(400, {"error": str(exc)})
+                    self._error(code_for_message(str(exc), fallback="bad_request"), str(exc))
                 except (TypeError, ValueError):
-                    self._json(400, {"error": "invalid query"})
+                    self._error("request.invalid_query", "invalid query")
                 except MemoryConflictError as exc:
-                    self._json(409, {"error": str(exc)})
+                    self._error(code_for_message(str(exc), fallback="conflict"), str(exc))
                 except Exception:
-                    self._json(500, {"error": "internal_error"})
+                    self._error("internal_error", "internal_error")
 
             do_POST = do_GET
             do_DELETE = do_GET

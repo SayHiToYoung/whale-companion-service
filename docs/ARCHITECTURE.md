@@ -4,6 +4,9 @@
 >
 > - 上下文如何从原始事件走到模型 → [`CONTEXT-PIPELINE.md`](CONTEXT-PIPELINE.md)
 > - 她何时开口、关系允许到哪一步 → [`COMPANION-POLICIES.md`](COMPANION-POLICIES.md)
+> - 客户端接入面：请求响应、幂等键、错误码、重试与兼容规则 → [`CLIENT-CONTRACT.md`](CLIENT-CONTRACT.md)
+> - 哪些入口会改变状态、以什么语义改变 → [`STATE-ADVANCEMENT.md`](STATE-ADVANCEMENT.md)
+> - 外部观察（桌宠、日历、天气）如何进入系统 → [`PERCEPTION-INPUTS.md`](PERCEPTION-INPUTS.md)
 > - 上述行为的可执行验收口径 → [`ACCEPTANCE.md`](ACCEPTANCE.md)
 >
 > [`DESIGN-living-companion.md`](DESIGN-living-companion.md) 是**已废弃的设计底稿**，
@@ -11,13 +14,14 @@
 
 ## 定位
 
-本仓库是小鲸与大鲸的权威共享大脑。桌宠小鲸是感知器官，手机大鲸是陪伴界面，Agent Office
-是可选视觉舞台；三者都不拥有第二份权威记忆或人格。
+本仓库是可独立运行的权威陪伴大脑。Web 与手机大鲸是陪伴界面；桌宠小鲸是可选的感知与
+展示端；Agent Office 是可选视觉舞台。所有客户端都通过统一 API 接入，均不拥有第二份
+权威记忆或人格。桌宠缺失时，对话、关系、情绪线程、日常生活和主动陪伴仍在本服务运行。
 
 ## 边界
 
 ```text
-dsh-pet-indesktop
+可选 dsh-pet-indesktop
   ActivityCollector → local outbox → MemoryServiceConnector
                                       │
                                       │ HTTPS / API v1
@@ -31,11 +35,15 @@ whale-companion-service
 dsh-pet-indesktop ← localhost handoff protocol → dsh-agent-office
 ```
 
-- 桌宠只能通过 `POST /v1/memory/batches` 上传事实、线索和用户明确情绪。
+- 桌宠若接入，只能通过 `POST /v1/memory/batches` 上传事实、线索和用户明确情绪。
 - 手机 PWA 只通过服务 API 读取记忆、领取开场和写入对话。
+- 所有客户端共用同一套对话接口，**不存在第二套聊天通道**。这套接口的正式契约由
+  `GET /v1/contract`（OpenAPI 3.1）提供，细则见 [`CLIENT-CONTRACT.md`](CLIENT-CONTRACT.md)。
 - Agent Office 不连接本服务，不读取手机对话，也不持有记忆数据库。
 - SQLite 默认路径保持为 `~/.dsh-whale-memory/memory.sqlite3`。
 - 协议版本当前为 `1`；不兼容变更必须升级版本，禁止静默改变字段语义。
+  memory protocol v1（记忆批次）与客户端 API v1（对话面）是两条**独立**的版本线，
+  各自演进，互不牵动。
 - `/debug/` 是仅用于本地闭环验证的观察与控制界面；它读取两端权威状态，不创建第三份记忆。
 
 ## 长期认识与边界
@@ -204,17 +212,61 @@ publish 后才影响聊天。rollback 不覆盖历史，而是从指定历史版
 
 | 数据或行为 | 权威所有者 |
 | --- | --- |
-| 前台应用采样、本地未发送 outbox | 桌宠小鲸 |
+| 可选的前台应用采样、本地未发送 outbox | 桌宠小鲸 |
 | 已接收 L1/L2/L3、生命周期、对话、消费游标 | 共享陪伴服务 |
 | 大鲸提示词、模型调用、事实防线 | 共享陪伴服务 |
 | 手机消息展示与断线发送队列 | 手机 PWA |
 | 桌面/Office 唯一视觉归属 | 桌宠的 AgentOfficeConnector |
+| 客户端接入契约、幂等键语义、错误码 | 共享陪伴服务（`client_contract.py`） |
+| 幂等键的生成与本地留存 | 各客户端 |
+
+## 客户端契约（第二阶段）
+
+Web、手机 PWA、控制台、未来桌宠和任何其它客户端，共用同一套对话接口。
+**不创建第二套聊天接口。** 完整细则见 [`CLIENT-CONTRACT.md`](CLIENT-CONTRACT.md)，
+机器可读版本由服务自己在 `GET /v1/contract` 提供（OpenAPI 3.1，无需口令）。
+
+契约的单一来源是 [`whale_companion_service/client_contract.py`](../whale_companion_service/client_contract.py)：
+它同时是接口文档、错误目录和可执行的校验规则，`tests/test_client_contract.py`
+拿真实 HTTP 响应打这份 schema，所以文档不可能领先或落后于实现。
+
+四个标识符的作用域，是数据里已经固化的事实：
+
+| 标识符 | 生成方 | 作用域 | 重放语义 |
+| --- | --- | --- | --- |
+| `messageId` | 客户端 | `(userId)` | 同内容 → `duplicate: true` 且回复复用；异内容 → 409 |
+| `deliveryId` | 客户端 | `(userId)` | 逐字节相同的结果，不产生第二条主动消息 |
+| `claimId` | 客户端 | `(userId, deviceId)` | 追加 `duplicateClaim: true` |
+| `afterMessageSeq` | 服务端 | `(userId)` | 排他游标，跨客户端共享的单调有序时间线 |
+
+翻页信号有两个：`hasMoreExact` 精确（多取一条判定），`hasMore` 保守（取满即 true，
+语义不变，留给旧客户端）。新增精确字段而不改旧字段，是为了不让任何在用的客户端改行为。
+
+错误响应统一为 `error`（兼容用自由文本）+ `code`（稳定机器码）+ `message`（可读）
++ `retryable`（唯一的重试依据）+ `status` + `apiVersion`，可重试的错误还可以带
+`retryAfterSeconds`（与响应头 `Retry-After` 同值）。
+**能不能重试由错误码自己的语义决定，不由状态码区间决定。** 绝大多数 4xx 是
+「请求本身有问题」，等再久也不会成功；但 408 与 429 说的是「此刻不行，等一下再来」，
+它们是**可重试的 4xx**。当前没有路径返回它们，先把语义和 `Retry-After` 通道定死，
+将来接限流或超时时客户端不必改一行重试逻辑。重试必须带同一个幂等键。
+
+客户端身份与 capabilities（请求体 `client` 或 `X-Whale-Client-*` 请求头）**全部可选**，
+只用于观测：不进模型上下文，不参与主动决策，不改变任何已有数据的含义。
+未知的 `kind` 与未知的 capability 一律接受而不是拒绝。
 
 ## 兼容策略
 
-桌宠仓库的 `scripts/run-memory-server.py` 是过渡兼容入口，只负责读取桌宠现有模型设置并加载
-同级的 `whale-companion-service`。服务仓库也提供不依赖桌宠设置的独立启动器。两条启动路径
-运行的是同一份服务实现，不复制业务逻辑。
+本服务的 `whale_companion_service.cli` 和 `scripts/run-memory-server.py` 只读取本服务定义的
+`WHALE_*` 环境变量，不导入桌宠包，也不复用桌宠虚拟环境或密钥。桌宠仓库如保留过渡兼容
+入口，应把配置显式转换成本服务环境变量后启动同一份服务实现，不复制业务逻辑。
+
+客户端侧的兼容承诺：
+
+1. 顶层 `error` 字符串永不移除——升级前的客户端只认得它。
+2. 新字段一律可选且有默认；不发新字段的请求永远合法，行为与从前逐字节相同。
+3. 响应只增字段不改语义；客户端必须容忍未知字段。
+4. 破坏性变更需要新的 `apiVersion`，且新旧并存。
+5. memory protocol v1 的已有字段语义不受客户端 API 版本影响。
 
 ## 活着的陪伴（五个子系统）
 
@@ -599,8 +651,12 @@ next_eligible_at / completed_beats / available_branches`，外加 `weight` 和 `
 
 ### 读与写分开
 
-`GET /v1/companion/proactive` 只算不写，故事的推进也一样——只读的轮询不该改变故事状态。
-落库只发生在 `POST /v1/companion/proactive/deliveries` 和 `GET /v1/companion/story`。
+`GET /v1/companion/proactive` 不推进任何陪伴状态：候选队列、发送记录、故事进度一律不动。
+故事落库只发生在 `POST /v1/companion/proactive/deliveries` 和 `GET /v1/companion/story`。
+
+一个诚实的例外：只读路径会惰性初始化当天的生活基线（`daily_state`）。那是当日基线的
+首次落定，由日期确定性生成，同一时刻重复调用得到逐字节相同的结果。完整的入口分类、
+不变式与审计表见 [`STATE-ADVANCEMENT.md`](STATE-ADVANCEMENT.md)。
 
 ## 2026-09-09：对话推进与主动消息闭环修复
 

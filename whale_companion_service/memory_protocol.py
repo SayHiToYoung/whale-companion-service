@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from .client_contract import CONTRACT_PATH, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 from .dialogue_state import emotional_dialogue_state, is_emotional_bid, is_explicit_stop
 from .memory_lifecycle import lifecycle_transition_from_text
 
@@ -25,7 +26,19 @@ class ProtocolError(ValueError):
 
 
 class SyncTransportError(RuntimeError):
-    pass
+    """传输或服务端错误。
+
+    消息格式与从前逐字保持不变（`HTTP <code>: <detail>`），旧调用方照旧能读。
+    新增的是三个属性：`code` / `retryable` / `status`。客户端按 `retryable`
+    决定重不重试，按 `code` 分支，不需要再去解析人话。
+    """
+
+    def __init__(self, message: str, *, code: str = "", retryable: bool = False,
+                 status: int = 0) -> None:
+        super().__init__(message)
+        self.code = str(code or "")
+        self.retryable = bool(retryable)
+        self.status = int(status or 0)
 
 
 def canonical_json(value: Any) -> str:
@@ -321,10 +334,10 @@ def build_grounded_companion_reply(
     dialogue_state = emotional_dialogue_state(list(conversation or []))
     if dialogue_state["phase"] == "exploring":
         if dialogue_state["turn"] == 1:
-            return f"原来是{text.rstrip('。！？!?')}这件事。具体是哪一段让你忍不住叹气了？"
+            return "原来是这件事。具体是哪一段让你忍不住叹气了？"
         if dialogue_state["turn"] == 2:
-            return f"嗯，我跟上了，是{text.rstrip('。！？!?')}。这件事最戳你的地方是什么？"
-        return f"好，我知道你刚才那声叹气是从这里来的：{text.rstrip('。！？!?')}。你继续说，我不急着替你下结论。"
+            return "嗯，线索接上了。这件事最戳你的地方是什么？"
+        return "好，我知道刚才那声叹气是从这件事来的。你继续说，我不急着替你下结论。"
 
     if mentions_meeting:
         duration_stated = bool(re.search(
@@ -371,15 +384,42 @@ def is_reaction_to_companion(text: str) -> bool:
 
 
 class MemorySyncClient:
-    def __init__(self, base_url: str, token: str, *, timeout: float = 8.0) -> None:
+    """核心客户端 API 的 Python 实现。
+
+    与手机 PWA 走的是同一套接口、同一套幂等键、同一份有序历史——桌宠将来重新接入时
+    用的也是这里的方法，而不是第二套聊天通道。`client` 是可选身份声明，
+    不传就是匿名，行为与从前完全一致。
+    """
+
+    def __init__(self, base_url: str, token: str, *, timeout: float = 8.0,
+                 client: dict | None = None) -> None:
         self.base_url = str(base_url or "").strip().rstrip("/")
         self.token = str(token or "")
         self.timeout = max(1.0, float(timeout))
+        self.client = dict(client) if isinstance(client, dict) else None
         parsed = urllib.parse.urlparse(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ProtocolError("invalid memory service URL")
         if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ProtocolError("remote memory service must use HTTPS")
+
+    def _identity_headers(self) -> dict:
+        client = self.client or {}
+        headers = {}
+        if client.get("clientId"):
+            headers["X-Whale-Client-Id"] = str(client["clientId"])
+        if client.get("kind"):
+            headers["X-Whale-Client-Kind"] = str(client["kind"])
+        if client.get("version"):
+            headers["X-Whale-Client-Version"] = str(client["version"])
+        if client.get("capabilities"):
+            headers["X-Whale-Client-Capabilities"] = " ".join(
+                str(item) for item in client["capabilities"])
+        return headers
+
+    def _with_client(self, payload: dict, client: dict | None) -> dict:
+        declared = client if client is not None else self.client
+        return {**payload, "client": declared} if declared else payload
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
         data = None if payload is None else canonical_json(payload).encode("utf-8")
@@ -391,6 +431,7 @@ class MemorySyncClient:
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.token}",
+                **self._identity_headers(),
             },
         )
         try:
@@ -398,13 +439,23 @@ class MemorySyncClient:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             raw = exc.read(64 * 1024)
+            code, retryable = "", exc.code >= 500
             try:
-                detail = json.loads(raw.decode("utf-8")).get("error")
+                body = json.loads(raw.decode("utf-8"))
+                detail = body.get("error")
+                code = str(body.get("code") or "")
+                if isinstance(body.get("retryable"), bool):
+                    retryable = body["retryable"]
             except Exception:
                 detail = str(exc)
-            raise SyncTransportError(f"HTTP {exc.code}: {detail}") from exc
+            raise SyncTransportError(
+                f"HTTP {exc.code}: {detail}",
+                code=code, retryable=retryable, status=exc.code,
+            ) from exc
         except (OSError, urllib.error.URLError) as exc:
-            raise SyncTransportError(str(exc)) from exc
+            # 连不上是典型的可重试错误：请求可能根本没到，也可能到了但回执丢了。
+            # 幂等键就是为这一刻准备的——原样重放安全。
+            raise SyncTransportError(str(exc), code="transport", retryable=True) from exc
         if len(raw) > MAX_RESPONSE_BYTES:
             raise SyncTransportError("memory service response too large")
         try:
@@ -430,12 +481,14 @@ class MemorySyncClient:
         })
         return self._request("GET", f"/v1/memory/stream?{query}")
 
-    def claim_opening(self, *, user_id: str, device_id: str, claim_id: str) -> dict:
-        return self._request("POST", "/v1/companion/openings/claim", {
+    def claim_opening(self, *, user_id: str, device_id: str, claim_id: str,
+                      client: dict | None = None) -> dict:
+        """领取一次开场。`claimId` 的作用域是 `(userId, deviceId)`，重放追加 duplicateClaim。"""
+        return self._request("POST", "/v1/companion/openings/claim", self._with_client({
             "userId": user_id,
             "deviceId": device_id,
             "claimId": claim_id,
-        })
+        }, client))
 
     def update_lifecycle(
         self, *, user_id: str, memory_id: str, status: str, reason: str = "manual_update"
@@ -462,20 +515,66 @@ class MemorySyncClient:
         return self._request("GET", f"/v1/memory/digests?{query}")
 
     def post_message(
-        self, *, user_id: str, device_id: str, message_id: str, role: str, text: str
+        self, *, user_id: str, device_id: str, message_id: str, role: str, text: str,
+        client: dict | None = None,
     ) -> dict:
-        return self._request("POST", "/v1/conversation/messages", {
+        """写入一条消息。
+
+        `messageId` 是客户端生成的幂等键，作用域 `(userId)`。回执丢了就原样重放：
+        同 id 同内容拿回同一条回复（`duplicate: true`），不会多出第二条。
+        同 id 换内容会拿到 409 `conversation.message_id_conflict`，那是换新 id 的信号，
+        不是重试的信号。
+        """
+        return self._request("POST", "/v1/conversation/messages", self._with_client({
             "userId": user_id,
             "deviceId": device_id,
             "messageId": message_id,
             "role": role,
             "text": text,
-        })
+        }, client))
 
-    def messages(self, user_id: str, after_message_seq: int = 0, limit: int = 200) -> dict:
+    def messages(self, user_id: str, after_message_seq: int = 0,
+                 limit: int = DEFAULT_PAGE_LIMIT) -> dict:
+        """按排他游标读同一份共享历史。断线恢复就是把上次的 nextMessageSeq 递回来。
+
+        翻页看 `hasMoreExact`（精确）。`hasMore` 是语义不变的保守信号，
+        取满一页就为 true，只为旧客户端保留。
+        """
         query = urllib.parse.urlencode({
             "userId": user_id,
             "afterMessageSeq": max(0, int(after_message_seq)),
-            "limit": max(1, min(500, int(limit))),
+            "limit": max(1, min(MAX_PAGE_LIMIT, int(limit))),
         })
         return self._request("GET", f"/v1/conversation/messages?{query}")
+
+    def conversation_messages(self, *, user_id: str, after_message_seq: int = 0,
+                              limit: int = DEFAULT_PAGE_LIMIT) -> dict:
+        """`messages()` 的关键字参数别名，与桌宠侧客户端同名，跨仓库读起来是一件事。"""
+        return self.messages(user_id, after_message_seq, limit)
+
+    def proactive_decision(self, *, user_id: str, activity: str = "idle") -> dict:
+        """只读评估。轮询它不改变任何状态，也不算作已经说过。"""
+        query = urllib.parse.urlencode({"userId": user_id, "activity": activity})
+        return self._request("GET", f"/v1/companion/proactive?{query}")
+
+    def deliver_proactive(self, *, user_id: str, device_id: str = "proactive",
+                          delivery_id: str, activity: str = "idle",
+                          client: dict | None = None) -> dict:
+        """落定一条主动消息。这是主动消息算作说过的唯一入口。
+
+        `deliveryId` 作用域 `(userId)`：重放拿回逐字节相同的结果，一条主动不会记成两条。
+        """
+        return self._request("POST", "/v1/companion/proactive/deliveries", self._with_client({
+            "userId": user_id,
+            "deviceId": device_id,
+            "deliveryId": delivery_id,
+            "activity": activity,
+        }, client))
+
+    def health(self) -> dict:
+        """服务就绪状态与 API 能力声明。无需鉴权，也不探测任何可选客户端。"""
+        return self._request("GET", "/health")
+
+    def contract(self) -> dict:
+        """取回机器可读的客户端契约文档。"""
+        return self._request("GET", CONTRACT_PATH)

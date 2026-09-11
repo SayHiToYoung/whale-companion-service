@@ -2,6 +2,9 @@
 
 const STORAGE_KEY = "whale-mobile-settings-v1";
 const OUTBOX_KEY = "whale-mobile-outbox-v1";
+// 这个 PWA 按第 1 版客户端契约实现（见 GET /v1/contract）。
+const CLIENT_API_VERSION = 1;
+const CLIENT_VERSION = "2.0.0";
 
 const elements = {
   conversation: document.querySelector("#conversation"),
@@ -58,6 +61,21 @@ function loadSettings() {
     token: String(saved.token || "local-dev-token"),
     userId: String(saved.userId || "local-user"),
     deviceId: String(saved.deviceId || randomId("phone")),
+    clientId: String(saved.clientId || randomId("client")),
+  };
+}
+
+// 可选的客户端身份声明。服务端不要求任何一项，只是拿它来分辨"谁在读同一份历史"。
+// 这里声明的能力是这个 PWA 真的实现了的，不是许愿。
+const CLIENT_CAPABILITIES = ["conversation.send", "conversation.history", "proactive.receive"];
+
+function clientIdentity() {
+  return {
+    clientId: state.settings.clientId,
+    kind: "mobile",
+    version: CLIENT_VERSION,
+    apiVersion: CLIENT_API_VERSION,
+    capabilities: CLIENT_CAPABILITIES,
   };
 }
 
@@ -70,7 +88,30 @@ function authHeaders() {
     "Accept": "application/json",
     "Content-Type": "application/json",
     "Authorization": `Bearer ${state.settings.token}`,
+    "X-Whale-Client-Id": state.settings.clientId,
+    "X-Whale-Client-Kind": "mobile",
+    "X-Whale-Client-Version": CLIENT_VERSION,
+    "X-Whale-Api-Version": String(CLIENT_API_VERSION),
+    "X-Whale-Client-Capabilities": CLIENT_CAPABILITIES.join(" "),
   };
+}
+
+// 服务端错误信封（code / message / retryable）。旧服务端只回 error 字符串，
+// 那种情况下 retryable 按 HTTP 状态推断，行为与升级前一致。
+//
+// `retryable` 是唯一的重试依据，**不按状态码区间推断**：408 与 429 是可重试的 4xx，
+// 它们说的是"此刻不行"而不是"请求有问题"。只有在服务端根本没给这个字段时
+// （升级前的旧服务端）才退回到按状态推断。
+function apiError(payload, status) {
+  const text = String(payload.error || payload.message || `连接失败 (HTTP ${status})`);
+  const error = new Error(text);
+  error.code = String(payload.code || "");
+  error.status = status;
+  error.retryable = typeof payload.retryable === "boolean" ? payload.retryable : status >= 500;
+  // 服务端建议的退避时长（秒）。没有就由客户端自己决定隔多久再试。
+  error.retryAfterSeconds = Number(payload.retryAfterSeconds) > 0
+    ? Number(payload.retryAfterSeconds) : 0;
+  return error;
 }
 
 async function api(path, options = {}) {
@@ -82,7 +123,12 @@ async function api(path, options = {}) {
       cache: "no-store",
     });
   } catch (_) {
-    throw new Error("连不上记忆服务，请检查网络或服务是否已启动");
+    // 请求可能根本没发出去，也可能发出去了但回执丢了。幂等键就是为这一刻准备的：
+    // 原样重放安全，所以这类错误一律标为可重试。
+    const offline = new Error("连不上记忆服务，请检查网络或服务是否已启动");
+    offline.retryable = true;
+    offline.code = "transport";
+    throw offline;
   }
   let payload = {};
   try {
@@ -91,7 +137,7 @@ async function api(path, options = {}) {
     throw new Error(`记忆服务返回了无法读取的内容 (HTTP ${response.status})`);
   }
   if (!response.ok) {
-    throw new Error(payload.error || `连接失败 (HTTP ${response.status})`);
+    throw apiError(payload, response.status);
   }
   return payload;
 }
@@ -195,7 +241,11 @@ async function loadHistory() {
     if (state.settings !== settings) return;
     for (const message of result.messages || []) renderMessage(message);
     const next = Number(result.nextMessageSeq);
-    more = Boolean(result.hasMore) && next > state.nextMessageSeq;
+    // 新服务端给出精确的 hasMoreExact，直接用它；旧服务端只有保守的 hasMore，
+    // 那就仍旧要求游标前进，否则最后一页刚好取满时会多翻一轮空页。
+    more = typeof result.hasMoreExact === "boolean"
+      ? result.hasMoreExact && next > state.nextMessageSeq
+      : Boolean(result.hasMore) && next > state.nextMessageSeq;
     state.nextMessageSeq = Math.max(state.nextMessageSeq, next || 0);
   }
 }
@@ -219,7 +269,8 @@ async function syncConversation() {
       localStorage.setItem(key, deliveryId);
       const result = await api("/v1/companion/proactive/deliveries", {
         method: "POST", body: JSON.stringify({userId: state.settings.userId,
-          deviceId: state.settings.deviceId, deliveryId, activity: "active"}),
+          deviceId: state.settings.deviceId, deliveryId, activity: "active",
+          client: clientIdentity()}),
       });
       if (state.settings !== settings) return;
       localStorage.removeItem(key);
@@ -271,6 +322,7 @@ async function sendMessage(item, article = null) {
         messageId: item.messageId,
         role: "user",
         text: item.text,
+        client: clientIdentity(),
       }),
     });
     const remaining = outbox().filter((row) => row.messageId !== item.messageId);
@@ -311,7 +363,14 @@ async function sendMessage(item, article = null) {
       delete article.dataset.pending;
       article.dataset.failed = "true";
     }
-    showStatus(`暂时没送出去，联网后会再试。${error.message}`, "error", 6000);
+    if (error.retryable === false) {
+      // 服务端说重试永远不会成功（比如同一个 messageId 已经用于另一段内容）。
+      // 留在待发箱里只会无限重放同一个失败，所以就地取出并如实告诉用户。
+      storeOutbox(outbox().filter((row) => row.messageId !== item.messageId));
+      showStatus(`这条没能送出，重试也不会成功。${error.message}`, "error", 7000);
+    } else {
+      showStatus(`暂时没送出去，联网后会再试。${error.message}`, "error", 6000);
+    }
     return false;
   } finally {
     state.sending = false;
@@ -323,6 +382,9 @@ async function flushOutbox() {
     const article = messageArticle(item.messageId)
       || renderMessage({...item, role: "user"}, {pending: true});
     const ok = await sendMessage(item, article);
+    // 可重试的失败要停下来等下一次联网；不可重试的那条已经被丢出待发箱，
+    // 继续处理后面的消息才是对的。
+    if (!ok && !outbox().some((row) => row.messageId === item.messageId)) continue;
     if (!ok) break;
   }
 }

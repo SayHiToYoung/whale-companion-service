@@ -342,9 +342,19 @@ def apply_story_gates(arcs: list[StoryArc], *, permissions: dict, boundary_state
     return result
 
 
+def order_arcs(arcs: list[StoryArc]) -> list[StoryArc]:
+    """故事线的规范顺序：按 arc id 排。
+
+    落库的读取顺序（`ORDER BY arc_id`）和刚在内存里起线的追加顺序本来不一样，
+    于是同一时刻先读一次和后读一次会拿到两份顺序不同的 `arcs`——状态没变，答案却变了。
+    起线之后一律走这里归一，读写两条路径因此得到逐字节相同的结果。
+    """
+    return sorted(arcs, key=lambda arc: arc.id)
+
+
 def select_current_arcs(arcs: list[StoryArc]) -> list[StoryArc]:
     """同时最多一条主线 + 一条轻支线。再多就成了连续剧。"""
-    active = [arc for arc in arcs if arc.status == "active"]
+    active = [arc for arc in order_arcs(arcs) if arc.status == "active"]
     picked = []
     for weight in ARC_WEIGHTS:
         candidate = next((arc for arc in active if arc.weight == weight), None)
